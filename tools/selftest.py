@@ -31,9 +31,9 @@ sys.path.insert(0, _ROOT)
 from core.tol_core import (DIST_KEYS, HOLE_DEV, IT_GRADES, SHAFT_DEV,  # noqa: E402
                            allocate, analyze, auto_signs, default_links,
                            example_links, it_grade_for, it_segment_mean,
-                           it_table, it_value, monte_carlo, new_link,
-                           parse_zone, ppm_to_sigma_level, sigma_level_table,
-                           tolerance_factor)
+                           it_table, it_value, link_calc, monte_carlo,
+                           new_link, parse_zone, ppm_to_sigma_level,
+                           sigma_level_table, tolerance_factor)
 
 OUT_DIR = os.path.join(_ROOT, "tools", "out")
 LOG: list[str] = []
@@ -312,6 +312,29 @@ def test_thermal():
     check("关闭热修正后不变", analyze(lh, use_thermal=False)["nominal"], 100.0, 1e-12)
 
 
+def test_explicit_xi():
+    log("")
+    log("【11a】显式传递系数 ξ（斜面 / 投影等非平行环）")
+    # 默认：不显式给 ξ 时按 sign 取 ±1
+    check("默认 ξ（增环）", link_calc(new_link(nominal=10, es=0.05, ei=-0.05))["xi"], 1)
+    check("默认 ξ（减环）",
+          link_calc(new_link(nominal=10, es=0.05, ei=-0.05, sign=-1))["xi"], -1)
+    # 显式 ξ = 0.5（cos60°）：单环 ±0.05 → WC 半带 = 0.5×0.05 = 0.025，N₀ = 5
+    r = analyze([new_link(nominal=10.0, es=0.05, ei=-0.05, xi=0.5)])
+    check("ξ=0.5 单环 N₀", r["nominal"], 5.0, 1e-12)
+    check("ξ=0.5 单环 WC 半带", r["wc"]["T"] / 2.0, 0.025, 1e-12)
+    check("ξ=0.5 单环 RSS 半带", r["rss"]["T"] / 2.0, 0.025, 1e-12)
+    # 显式负 ξ：-0.707（投影方向反向）
+    r2 = analyze([new_link(nominal=10.0, es=0.05, ei=-0.05, xi=-0.707)])
+    check("ξ=-0.707 单环 N₀", r2["nominal"], -7.07, 1e-12)
+    check("ξ=-0.707 WC 半带", r2["wc"]["T"] / 2.0, 0.03535, 1e-9)
+    # allocate 里 dict(l) 复制环，应保留显式 ξ
+    al = allocate([new_link(nominal=10.0, es=0.05, ei=-0.05, xi=0.5)],
+                  closing_tol=0.1, method="equal", rule="rss")
+    check("分配复算保留显式 ξ",
+          link_calc(al["new_links"][0])["xi"], 0.5, 1e-12)
+
+
 # =====================================================================
 # 二、示意图几何自检
 # =====================================================================
@@ -535,13 +558,95 @@ def test_ui():
         # ---- 组成环表的只读计算列必须被回填（否则要空着三列很浪费）----
         check_true("公差列已回填", tol.table.item(0, 7).text() not in ("", "—"),
                    f"（{tol.table.item(0, 7).text()}）")
-        check("ξ 列已回填", tol.table.item(0, 8).text(), "+1")
+        check("ξ 列已回填（自动档显示实际系数）",
+              tol.table.cellWidget(0, 8).currentText(), "自动（+1）")
         check_true("贡献率列已回填",
                    tol.table.item(0, 9).text().endswith("%"),
                    f"（{tol.table.item(0, 9).text()}）")
         # 回填必须屏蔽 cellChanged，否则 recalc 会自激成死循环；
         # 能跑到这里就说明没锁死，再确认一次结果仍在
         check_true("回填后结果依然有效（未自激死循环）", tol._res is not None)
+
+        # ---- ξ 下拉：显式系数（斜面/投影环）与自动档互相切换 ----
+        from PySide6.QtWidgets import QComboBox  # noqa: E402
+        from ui.pages import STATE  # noqa: E402
+        win.tabs.setCurrentIndex(0)
+        for _ in range(6):
+            app.processEvents()
+        xb = tol.table.cellWidget(0, 8)
+        check_true("ξ 列是下拉框", isinstance(xb, QComboBox))
+        check("ξ 选项数", xb.count(), 11)
+        xb.setCurrentIndex(xb.findText("+0.707"))
+        for _ in range(6):
+            app.processEvents()
+        tol.recalc()        # _kick 走 240ms 防抖定时器，测试里直接触发
+        check("显式 ξ 已写入状态", STATE.links[0]["xi"], 0.707, 1e-12)
+        # 默认 5 环 N₀=60，A1 基本尺寸 10 → ξ 变 0.707 后 N₀ = 60 − 10 + 7.07
+        check("显式 ξ 改变封闭环 N₀", round(tol._res["nominal"], 4), 57.07, 1e-9)
+        check_true("环型随 ξ 符号联动",
+                   tol.table.cellWidget(0, 5).currentIndex() == 0)
+        sb = tol.table.cellWidget(0, 5)
+        sb.setCurrentIndex(1)                       # 切「减环」→ 回到自动 −1
+        for _ in range(6):
+            app.processEvents()
+        tol.recalc()
+        check("切环型清空显式 ξ", STATE.links[0]["xi"], None)
+        check("减环后 ξ 自动取 −1", round(tol._res["nominal"], 4), 40.0, 1e-9)
+        sb.setCurrentIndex(0)                       # 切回增环，恢复默认 60
+        for _ in range(6):
+            app.processEvents()
+        tol.recalc()
+        check("恢复增环后 N₀", round(tol._res["nominal"], 4), 60.0, 1e-9)
+
+        # ---- 标准公差选取弹窗：填上 / 下偏差 ----
+        from ui.pages import _STD_CATS, StdDevDialog  # noqa: E402
+        check("弹窗分类数", len(_STD_CATS), 6)
+        dlg = StdDevDialog(tol, 0)
+        # 常用配合：H7 @ ⌀10 → +0.015 / 0（kernel 已对照标准表验证过）
+        dlg.cb_cat.setCurrentIndex(_STD_CATS.index("常用配合"))
+        dlg.t.selectRow(0)
+        dlg._refresh_btns()
+        dlg.in_nom.set_value(10.0)
+        e0 = dlg._entries()[0]
+        es, ei, _tx = dlg._calc(e0, 0)
+        check("H7@10 上偏差", round(es, 4), 0.015)
+        check("H7@10 下偏差", round(ei, 4), 0.0)
+        dlg._apply(e0, 0, (es, ei))
+        check("配合条目已填入选中环",
+              (round(STATE.links[0]["es"], 4), round(STATE.links[0]["ei"], 4)),
+              (0.015, 0.0))
+        # PCB：PTH ⌀≤0.8 → ±0.08
+        dlg.cb_cat.setCurrentIndex(_STD_CATS.index("PCB"))
+        pcb = dlg._entries()
+        i1 = next(i for i, e in enumerate(pcb) if e["name"].startswith("金属化孔 PTH ⌀≤0.8"))
+        dlg.t.selectRow(i1)
+        dlg._refresh_btns()
+        es, ei, _tx = dlg._calc(pcb[i1], 0)
+        check("PCB PTH ±0.08", (round(es, 3), round(ei, 3)), (0.08, -0.08))
+        dlg._apply(pcb[i1], 0, (es, ei))
+        check("PCB 条目已填入选中环",
+              (round(STATE.links[0]["es"], 3), round(STATE.links[0]["ei"], 3)),
+              (0.08, -0.08))
+        # 螺栓通孔 GB/T 5277：M6 精装配 ⌀6.4 H12 → +0.150 / 0，且更新基本尺寸
+        dlg.cb_cat.setCurrentIndex(_STD_CATS.index("螺栓通孔 GB/T 5277"))
+        e2 = dlg._entries()[3]                      # 第 4 条 = M6
+        check_true("5277 条目是 M6", e2["name"].startswith("M6"), e2["name"][:6])
+        es, ei, _tx = dlg._calc(e2, 0)
+        check("M6 精装 H12@⌀6.4", (round(es, 4), round(ei, 4)), (0.15, 0.0))
+        dlg._apply(e2, 0, (es, ei))
+        check("通孔条目同步基本尺寸", STATE.links[0]["nominal"], 6.4, 1e-12)
+        # 连接器 + 加工方式两类至少能算出数值（不抛异常）
+        dlg.cb_cat.setCurrentIndex(_STD_CATS.index("连接器"))
+        dlg.t.selectRow(0)
+        dlg._refresh_btns()
+        es, ei, _tx = dlg._calc(dlg._entries()[0], 0)
+        check_true("连接器条目可换算", es > 0 and ei < 0,
+                   f"（+{es:.4f} / {ei:.4f}）")
+        dlg.cb_cat.setCurrentIndex(_STD_CATS.index("加工方式 → IT"))
+        dlg.in_nom.set_value(30.0)
+        es, ei, _tx = dlg._calc(dlg._entries()[0], 0)   # 精车 IT8 @30 → ±0.0165
+        check("精车 IT8@30 半带", round(es, 4), 0.0165)
+        dlg.close()
 
         # ---- 组成环表本体：所有行直接可见、无内部滚动条（水平/垂直都不要）----
         from PySide6.QtGui import QFontMetrics  # noqa: E402
@@ -654,7 +759,8 @@ def main():
     log("=" * 70)
     for fn in (test_huawei_example, test_sigma_table, test_it_table,
                test_deviations, test_auto_signs, test_allocate,
-               test_monte_carlo, test_capability, test_thermal):
+               test_monte_carlo, test_capability, test_thermal,
+               test_explicit_xi):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001

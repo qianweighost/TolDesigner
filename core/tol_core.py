@@ -351,10 +351,13 @@ def new_link(no: str = "", name: str = "", nominal: float = 0.0,
              dist: str = DEFAULT_DIST, enabled: bool = True,
              alpha: float = 0.0, temp: float = STD_TEMP,
              k: float | None = None, e: float | None = None,
+             xi: float | None = None,
              note: str = "") -> dict:
     k0, e0 = dist_params(dist)
     return {"no": no, "name": name, "nominal": float(nominal),
             "es": float(es), "ei": float(ei), "sign": int(sign),
+            # xi：显式传递系数（斜面/投影等非平行环）。None = 按 sign 自动取 ±1
+            "xi": None if xi is None else float(xi),
             "dist": dist, "enabled": bool(enabled),
             "alpha": float(alpha), "temp": float(temp),
             "k": k0 if k is None else float(k),
@@ -386,7 +389,11 @@ def link_calc(link: dict, use_thermal: bool = False) -> dict:
         es, ei = ei, es
     T = es - ei
     dmid = (es + ei) / 2.0
-    xi = 1 if int(link["sign"]) >= 0 else -1
+    # 传递系数：优先用显式 ξ（斜面/投影等非平行环，可为 ±0.707 等）；
+    # 未指定时按增/减环取 ±1
+    xv = link.get("xi")
+    xi = float(xv) if xv is not None else \
+        (1 if int(link["sign"]) >= 0 else -1)
     k = float(link.get("k", 1.0))
     e = float(link.get("e", 0.0))
     if k <= 0:

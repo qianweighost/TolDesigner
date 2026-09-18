@@ -10,11 +10,12 @@ import math
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
-                               QComboBox, QFileDialog, QFrame, QGridLayout,
-                               QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                               QMessageBox, QPushButton, QScrollArea,
-                               QSizePolicy, QSplitter, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+                               QComboBox, QDialog, QFileDialog, QFrame,
+                               QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+                               QLineEdit, QMessageBox, QPushButton,
+                               QScrollArea, QSizePolicy, QSplitter,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
 
 from core.tol_core import (ALLOC_METHODS, DEFAULT_DIST, DISTRIBUTIONS,
                            DIST_KEYS, HOLE_DEV, IT_A, IT_GRADES, IT_MAX_SIZE,
@@ -582,7 +583,13 @@ _FORMAT_TIP = ("公差带代号，如 H7 / f6 / js6（可带直径，如 φ50H7�
 
 _LINK_COLS = ["编号", "名称", "基本尺寸\nmm", "上偏差\nmm", "下偏差\nmm",
               "环型", "分布状态", "公差\nmm", "ξ", "贡献率\n(统计法)"]
-_LINK_W = [58, 108, 84, 84, 84, 80, 140, 78, 40, 92]
+_LINK_W = [58, 108, 84, 84, 84, 80, 140, 78, 124, 92]
+
+# 传递系数 ξ 的可选项：第 0 项「自动」= 按增/减环取 ±1；
+# 其余为显式系数（斜面、投影等非平行环：cos30°=0.866、cos45°=0.707、
+# tan30°=1/√3≈0.577、cos60°=0.5，含正负）。文字必须与 f"{v:+g}" 严格一致。
+_XI_ITEMS = ["自动", "+1", "-1", "+0.866", "-0.866", "+0.707", "-0.707",
+             "+0.577", "-0.577", "+0.5", "-0.5"]
 
 
 class TolPage(QWidget):
@@ -658,6 +665,9 @@ class TolPage(QWidget):
                 ("自动判增减环", self._auto_signs,
                  "按封闭环基本尺寸反解各环的传递系数（子集和求解）"),
                 ("载入示例", self._load_example, "载入一个教科书级算例"),
+                ("标准选取…", self._pick_std,
+                 "弹窗选取标准公差：常用配合 / 按加工方式选 IT / "
+                 "标准件 / PCB / 连接器，填入选中环的上、下偏差"),
         ):
             b = QPushButton(text)
             b.setObjectName("Mini")
@@ -788,7 +798,16 @@ class TolPage(QWidget):
                 lambda _i, rr=r: self._set_field(rr, "dist"))
             t.setCellWidget(r, 6, db)
             cell(t, r, 7, "—", align="r")
-            cell(t, r, 8, "", align="c")
+            xb = QComboBox()
+            xb.addItems(_XI_ITEMS)
+            if l.get("xi") is not None:
+                _xi = xb.findText(f"{float(l['xi']):+g}")
+                xb.setCurrentIndex(_xi if _xi > 0 else 1)
+            xb.setToolTip("传递系数 ξ：自动 = 按增/减环取 ±1；"
+                          "斜面、投影等非平行环可显式选系数（cos30°=0.866 等）")
+            xb.currentIndexChanged.connect(
+                lambda _i, rr=r: self._set_field(rr, "xi"))
+            t.setCellWidget(r, 8, xb)
             cell(t, r, 9, "—", align="r")
         t.blockSignals(False)
         # 行数变了（增/删/移动/整表重建）都要重算高度，保证所有行直接可见、不出内部滚动条
@@ -809,14 +828,26 @@ class TolPage(QWidget):
             for i in range(t.rowCount()):
                 if i >= len(STATE.links):
                     break
-                no = str(STATE.links[i].get("no"))
+                lk = STATE.links[i]
+                no = str(lk.get("no"))
                 lc = lmap.get(no)
                 hit = next((c for c in pool if str(c.get("no")) == no), None)
                 if hit is not None:
                     pool.remove(hit)
                 cell(t, i, 7, "—" if not lc else f"{lc['T']:.4f}", align="r")
-                cell(t, i, 8, "—" if not lc else f"{lc['xi']:+d}", align="c",
-                     color=None if not lc else (INC if lc["xi"] >= 0 else DEC))
+                # ξ 列：第 0 项「自动」动态显示实际生效的传递系数
+                xb = t.cellWidget(i, 8)
+                if isinstance(xb, QComboBox):
+                    xb.blockSignals(True)
+                    if lk.get("xi") is None:
+                        xb.setItemText(0, "自动" if lc is None
+                                       else f"自动（{lc['xi']:+g}）")
+                        xb.setCurrentIndex(0)
+                    else:
+                        xb.setItemText(0, "自动")
+                        _xi = xb.findText(f"{float(lk['xi']):+g}")
+                        xb.setCurrentIndex(_xi if _xi > 0 else 1)
+                    xb.blockSignals(False)
                 cell(t, i, 9, "—" if hit is None
                      else f"{hit['share_rss'] * 100:.2f}%", align="r")
         finally:
@@ -859,12 +890,28 @@ class TolPage(QWidget):
     def _set_field(self, r: int, kind: str):
         if r >= len(STATE.links):
             return
-        w = self.table.cellWidget(r, 5 if kind == "sign" else 6)
+        l = STATE.links[r]
+        col = {"sign": 5, "dist": 6, "xi": 8}[kind]
+        w = self.table.cellWidget(r, col)
         if isinstance(w, QComboBox):
             if kind == "sign":
-                STATE.links[r]["sign"] = 1 if w.currentIndex() == 0 else -1
-            else:
-                STATE.links[r]["dist"] = DIST_KEYS[w.currentIndex()]
+                l["sign"] = 1 if w.currentIndex() == 0 else -1
+                l["xi"] = None                     # 切增/减环 = 回到自动 ±1
+            elif kind == "dist":
+                l["dist"] = DIST_KEYS[w.currentIndex()]
+            else:                                   # xi
+                txt = w.currentText()
+                if txt == "自动":
+                    l["xi"] = None
+                else:
+                    l["xi"] = float(txt)
+                    l["sign"] = 1 if l["xi"] >= 0 else -1
+                    # 环型跟着符号走（屏蔽信号，避免又把 xi 清回自动）
+                    sb = self.table.cellWidget(r, 5)
+                    if isinstance(sb, QComboBox):
+                        sb.blockSignals(True)
+                        sb.setCurrentIndex(0 if l["sign"] > 0 else 1)
+                        sb.blockSignals(False)
         self._kick()
 
     def _add_link(self):
@@ -910,6 +957,7 @@ class TolPage(QWidget):
             return
         for l, s in zip(STATE.links, signs):
             l["sign"] = s
+            l["xi"] = None      # 反解的是 ±1 组合，显式 ξ 一律清空回自动
         self._fill()
         self.recalc()
         QMessageBox.information(self, "自动判定完成", msg)
@@ -931,18 +979,27 @@ class TolPage(QWidget):
             QMessageBox.information(self, "未选中行", "请先在表格里点选一个组成环。")
             return
         try:
-            nom = self.q_nom.value()
+            txt = self.q_nom.text().strip().replace("，", "").replace(",", "")
+            nom = float(txt) if txt else None
             if nom is None:
                 nom = STATE.links[r]["nominal"]
             z = parse_zone(self.q_code.text(), nom)
         except (DesignError, ValueError) as e:
-            QMessageBox.warning(self, "代号无效", str(e))
+            QMessageBox.warning(self, "无法换算", str(e))
             return
         STATE.links[r]["es"] = z["es"]
         STATE.links[r]["ei"] = z["ei"]
         self._fill()
         self.table.selectRow(r)
         self.recalc()
+
+    def _pick_std(self):
+        r = self.table.currentRow()
+        if r < 0 or r >= len(STATE.links):
+            QMessageBox.information(self, "未选中行",
+                                    "请先在表格里点选一个组成环，再打开标准选取。")
+            return
+        StdDevDialog(self, r).exec()
 
     def _on_thermal(self):
         STATE.use_thermal = self.in_thermal.is_checked()
@@ -1097,7 +1154,7 @@ class TolPage(QWidget):
                  color=INC if row["xi"] >= 0 else DEC, bold=True)
             cell(t, r, 1, str(row.get("name") or ""))
             cell(t, r, 2, f"{row['T']:.4f}", align="r")
-            cell(t, r, 3, f"{row['xi']:+d}", align="c",
+            cell(t, r, 3, f"{row['xi']:+g}", align="c",
                  color=INC if row["xi"] >= 0 else DEC)
             cell(t, r, 4, f"{row['share_wc'] * 100:.2f}%", align="r")
             cell(t, r, 5, f"{row['share_rss'] * 100:.2f}%", align="r",
@@ -1129,7 +1186,7 @@ class TolPage(QWidget):
         sec.append(("组成环明细", [
             (f"{l.get('no', '—')} {l.get('name', '')}".strip(),
              f"A = {l['nominal']:g} mm　{l['es']:+.4f}/{l['ei']:+.4f}　"
-             f"ξ={l['xi']:+d}　{dist_label(l['dist'])}　"
+             f"ξ={l['xi']:+g}　{dist_label(l['dist'])}　"
              f"k={l['k']:.2f}　e={l['e']:+.2f}")
             for l in res["links"]]))
         w, s = res["wc"], res["rss"]
@@ -1159,7 +1216,7 @@ class TolPage(QWidget):
             sec.append(("合格判定与制程能力", rowsc))
         sec.append(("各环贡献率（降序）", [
             (f"{c.get('no', '—')} {c.get('name', '')}".strip(),
-             f"T={c['T']:.4f} mm　ξ={c['xi']:+d}　"
+             f"T={c['T']:.4f} mm　ξ={c['xi']:+g}　"
              f"极值法 {c['share_wc'] * 100:.2f}%　统计法 {c['share_rss'] * 100:.2f}%")
             for c in res["contrib"]]))
         warns = list(res.get("tips") or [])
@@ -1170,6 +1227,271 @@ class TolPage(QWidget):
         notes = [res["recommend_reason"]]
         save_report(self, "尺寸链公差分析报告", "尺寸链公差分析",
                     meta, sec, warns, notes)
+
+
+# =====================================================================
+# 标准公差选取弹窗（填上 / 下偏差）
+# =====================================================================
+
+def _std_entries() -> list[dict]:
+    """弹窗数据集。条目三选一：
+    zones=[(按钮文字, 代号, 基本尺寸覆盖|None), ...] —— 按 GB/T 1800.2 换算；
+    sym=±值 —— 直接对称填入；it="ITn" —— 按 ±ITn/2 对称填入。
+    期望值全部来自外部权威源或行业通用口径，不使用本程序自算值当依据。
+    """
+    E: list[dict] = []
+    A = E.append
+    # ---- 常用配合（GB/T 1800.1 / 1800.2，内置代号可直接换算）----
+    for nm, hz, sz, tip in (
+            ("间隙 · 滑动（轻负荷转动）", "H7", "g6", "滑动轴承、轻载导轨"),
+            ("间隙 · 一般转动", "H7", "f7", "泵类、常规转动配合"),
+            ("间隙 · 松转（大间隙）", "H8", "d9", "低温、多尘、宽间隙场合"),
+            ("过渡 · 对中可拆", "H7", "js6", "对中性好，手装/轻敲可拆"),
+            ("过渡 · 定位轻压", "H7", "k6", "定位销、轴承内圈常用"),
+            ("过渡 · 基轴制定位", "K7", "h6", "基轴制：销/冷拉轴定位孔"),
+    ):
+        A({"cat": "常用配合", "name": nm, "src": "GB/T 1800.1 / 1800.2",
+           "desc": f"{tip}；公差带 {hz}/{sz}",
+           "zones": [(f"孔侧 {hz}", hz, None), (f"轴侧 {sz}", sz, None)]})
+    # ---- 按加工方式选 IT（经济加工精度，±IT/2 对称填入）----
+    for nm, rng, g in (
+            ("外圆 · 精车", "IT7~9", "IT8"), ("外圆 · 半精车", "IT9~11", "IT10"),
+            ("外圆 · 粗车", "IT11~13", "IT12"), ("外圆 · 精磨", "IT6~7", "IT6"),
+            ("外圆 · 粗磨", "IT8~9", "IT9"), ("外圆 · 研磨/超精", "IT5~6", "IT5"),
+            ("孔 · 钻孔", "IT11~13", "IT12"), ("孔 · 扩孔", "IT10~13", "IT11"),
+            ("孔 · 铰孔", "IT7~9", "IT8"), ("孔 · 精镗", "IT7~9", "IT8"),
+            ("孔 · 拉孔", "IT7~9", "IT8"), ("孔 · 磨孔", "IT7~9", "IT8"),
+            ("孔 · 珩磨/研磨", "IT5~6", "IT6"),
+            ("平面 · 精铣/精刨", "IT7~8", "IT8"), ("平面 · 普通铣/刨", "IT9~11", "IT10"),
+            ("钣金 · 普通冲裁", "IT11~13", "IT12"), ("钣金 · 精冲", "IT8~9", "IT9"),
+            ("毛坯 · 铸/锻/切割（参考）", "IT14~16", "IT15"),
+    ):
+        A({"cat": "加工方式 → IT", "name": nm,
+           "desc": f"经济精度 {rng}，按对称 ±{g}/2 填入（按本环基本尺寸计算）",
+           "src": "经济加工精度（机械设计手册常用口径）", "it": g})
+    # ---- 标准件 ----
+    A({"cat": "标准件", "name": "滚动轴承 内圈 · 轴（内圈旋转负荷）",
+       "desc": "轴公差带 k6（GB/T 275 最常用），填入轴侧",
+       "src": "GB/T 275 滚动轴承配合（常用口径）",
+       "zones": [("轴 k6", "k6", None)]})
+    A({"cat": "标准件", "name": "滚动轴承 外圈 · 座孔（外圈固定）",
+       "desc": "座孔 H7（外圈轴向固定端）", "src": "GB/T 275（常用口径）",
+       "zones": [("孔 H7", "H7", None)]})
+    A({"cat": "标准件", "name": "滚动轴承 外圈 · 座孔（轴向游动端）",
+       "desc": "座孔 JS7（允许外圈轴向游动）", "src": "GB/T 275（常用口径）",
+       "zones": [("孔 JS7", "JS7", None)]})
+    A({"cat": "标准件", "name": "平键 · 毂槽宽（正常联结）",
+       "desc": "GB/T 1095 正常联结：毂槽 JS9（轴槽 N9 不在本工具内置代号，请手填）",
+       "src": "GB/T 1095 平键联结",
+       "zones": [("槽宽 JS9", "JS9", None)]})
+    A({"cat": "标准件", "name": "平键 · 槽宽（松联结）",
+       "desc": "GB/T 1095 松联结：轴槽/毂槽 H9（导向平键），毂槽亦可用 D10",
+       "src": "GB/T 1095 平键联结",
+       "zones": [("槽宽 H9", "H9", None), ("毂槽 D10", "D10", None)]})
+    A({"cat": "标准件", "name": "圆柱销 · 销孔（铰制装配）",
+       "desc": "销孔一般铰孔后 H7 装配", "src": "GB/T 119.1 / 装配惯例",
+       "zones": [("孔 H7", "H7", None)]})
+    A({"cat": "标准件", "name": "圆柱销 · 销径（GB/T 119.1）",
+       "desc": "销径公差带 h8（另有 m6 磨削销，m 不在本工具内置代号）",
+       "src": "GB/T 119.1 圆柱销",
+       "zones": [("销径 h8", "h8", None)]})
+    # ---- 螺栓通孔（GB/T 5277-1985）----
+    for spec, fine, mid, coarse in (
+            ("M3", 3.2, 3.4, 3.6), ("M4", 4.3, 4.5, 4.8), ("M5", 5.3, 5.5, 5.8),
+            ("M6", 6.4, 6.6, 7.0), ("M8", 8.4, 9.0, 10.0),
+            ("M10", 10.5, 11.0, 12.0), ("M12", 13.0, 13.5, 14.5),
+            ("M16", 17.0, 17.5, 18.5), ("M20", 21.0, 22.0, 24.0)):
+        A({"cat": "螺栓通孔 GB/T 5277", "set_nominal": True,
+           "name": f"{spec} 通孔（精装 ⌀{fine} / 中装 ⌀{mid} / 粗装 ⌀{coarse}）",
+           "desc": "填入同时把基本尺寸改为所选通孔直径",
+           "src": "GB/T 5277-1985（精 H12 / 中 H13 / 粗 H14）",
+           "zones": [(f"精装 ⌀{fine} H12", "H12", fine),
+                     (f"中装 ⌀{mid} H13", "H13", mid),
+                     (f"粗装 ⌀{coarse} H14", "H14", coarse)]})
+    # ---- PCB（行业常规制程能力值，各厂略有差异）----
+    A({"cat": "PCB", "name": "金属化孔 PTH ⌀≤0.8", "sym": 0.08,
+       "desc": "镀覆通孔成品孔径 ±0.08（插装/导通孔常规能力）",
+       "src": "IPC 体系 · 板厂常规制程能力"})
+    A({"cat": "PCB", "name": "金属化孔 PTH ⌀0.8~6.3", "sym": 0.15,
+       "desc": "镀覆通孔成品孔径 ±0.15", "src": "IPC 体系 · 常规制程能力"})
+    A({"cat": "PCB", "name": "非金属化孔 NPTH ⌀≤6.3", "sym": 0.05,
+       "desc": "非镀覆通孔 ±0.05（定位/安装孔）", "src": "IPC 体系 · 常规制程能力"})
+    A({"cat": "PCB", "name": "压接孔（压接连接器 / 铆装件）", "sym": 0.05,
+       "desc": "压接孔孔径公差收紧到 ±0.05，保证压接保持力",
+       "src": "IPC 体系 · 行业常用口径"})
+    A({"cat": "PCB", "name": "钻孔孔位（位置度，参考）", "sym": 0.075,
+       "desc": "孔位公差 ±0.075（数控钻常规）；用作跨板装配尺寸环时参考",
+       "src": "IPC 体系 · 行业常用口径"})
+    # ---- 连接器（内置代号组合表达）----
+    A({"cat": "连接器", "name": "接触件（插针/插孔）直径 · 精密", "it": "IT6",
+       "desc": "精密/高频连接器接触件常用 IT5~IT6，按对称 ±IT6/2 填入",
+       "src": "行业常用口径（精密连接器接触件等级）"})
+    A({"cat": "连接器", "name": "接触件（插针/插孔）直径 · 普通", "it": "IT7",
+       "desc": "一般工业连接器接触件常用 IT7~IT8，按对称 ±IT7/2 填入",
+       "src": "行业常用口径（工业连接器接触件等级）"})
+    A({"cat": "连接器", "name": "基座引脚孔（压接插针）", "zones": [("孔 H7", "H7", None)],
+       "desc": "插针压入基座引脚孔，孔按基孔制 H7", "src": "GB/T 1800.1（基孔制）"})
+    A({"cat": "连接器", "name": "插头/插座外壳 · 插拔导向（间隙）",
+       "zones": [("孔 H7", "H7", None), ("轴 f6", "f6", None)],
+       "desc": "导向外径 f6 对孔 H7，保证插拔顺畅且晃动量受控",
+       "src": "GB/T 1800.1 / 1800.2"})
+    A({"cat": "连接器", "name": "PCB 定位销 · 定位孔（基轴制）",
+       "zones": [("孔 J7", "J7", None), ("轴 h6", "h6", None)],
+       "desc": "定位销 h6（冷拉/车削），PCB/基座定位孔 J7，过渡对中",
+       "src": "GB/T 1800.1 / 1800.2"})
+    return E
+
+_STD_CATS = list(dict.fromkeys(e["cat"] for e in _std_entries()))
+
+
+class StdDevDialog(QDialog):
+    """按分类选取标准公差/常用值，一键填入选中组成环的上、下偏差。"""
+
+    def __init__(self, page: "TolPage", row: int):
+        super().__init__(page)
+        self.page = page
+        self.row = row
+        self.setWindowTitle("标准公差选取 → 填入选中环")
+        self.resize(780, 540)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+
+        l = STATE.links[row]
+        head = QHBoxLayout()
+        lab = QLabel(f"目标环：{l.get('no', '')} {l.get('name', '')}".strip())
+        lab.setObjectName("FieldHint")
+        head.addWidget(lab)
+        head.addStretch(1)
+        self.in_nom = NumberInput("基本尺寸", "mm", "按此尺寸换算代号/IT")
+        self.in_nom.set_value(l.get("nominal", 0.0))
+        head.addWidget(self.in_nom)
+        lay.addLayout(head)
+
+        catrow = QHBoxLayout()
+        catrow.addWidget(QLabel("分类："))
+        self.cb_cat = QComboBox()
+        self.cb_cat.addItems(_STD_CATS)
+        catrow.addWidget(self.cb_cat, 1)
+        lay.addLayout(catrow)
+
+        self.t = QTableWidget(0, 3)
+        self.t.setHorizontalHeaderLabels(["名称", "说明 / 数值", "依据"])
+        self.t.verticalHeader().setVisible(False)
+        self.t.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        hh = self.t.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        hh.setStretchLastSection(True)
+        for i, wd in enumerate([230, 330, 180]):
+            self.t.setColumnWidth(i, wd)
+        self.t.cellClicked.connect(lambda _r, _c: self._refresh_btns())
+        lay.addWidget(self.t, 1)
+
+        self.lab_prev = QLabel("选中条目后点下方按钮填入。")
+        self.lab_prev.setObjectName("FieldHint")
+        self.lab_prev.setWordWrap(True)
+        lay.addWidget(self.lab_prev)
+
+        self.btnrow = QHBoxLayout()
+        lay.addLayout(self.btnrow)
+
+        foot = QHBoxLayout()
+        self.lab_status = QLabel("")
+        self.lab_status.setObjectName("FieldHint")
+        foot.addWidget(self.lab_status)
+        foot.addStretch(1)
+        b_close = QPushButton("关闭")
+        b_close.clicked.connect(self.accept)
+        foot.addWidget(b_close)
+        lay.addLayout(foot)
+
+        self.cb_cat.currentIndexChanged.connect(lambda _i: self._fill_table())
+        self._fill_table()
+
+    # ---------------- 内部 ----------------
+    def _entries(self) -> list[dict]:
+        cat = self.cb_cat.currentText()
+        return [e for e in _std_entries() if e["cat"] == cat]
+
+    def _fill_table(self):
+        t = self.t
+        t.setRowCount(0)
+        for e in self._entries():
+            r = t.rowCount()
+            t.insertRow(r)
+            for c, txt in enumerate((e["name"], e["desc"], e["src"])):
+                it = QTableWidgetItem(txt)
+                it.setToolTip(e["desc"])
+                t.setItem(r, c, it)
+        fit_table(t, cap=300)
+
+    def _nom(self) -> float:
+        v = self.in_nom.value()
+        return 0.0 if v is None else float(v)
+
+    def _calc(self, e: dict, idx: int) -> tuple[float, float, str]:
+        """第 idx 个填入动作 → (上偏差, 下偏差, 展示文字)。抛 DesignError。"""
+        nom = self._nom()
+        if "zones" in e:
+            txt, code, nomv = e["zones"][idx]
+            n = nom if nomv is None else float(nomv)
+            z = parse_zone(code, n)
+            return z["es"], z["ei"], f"⌀{n:g} {code} → +{z['es']:.4f} / {z['ei']:.4f}"
+        if "sym" in e:
+            s = float(e["sym"])
+            return s, -s, f"±{s:g}"
+        T = it_value(nom, e["it"])
+        return T / 2.0, -T / 2.0, f"⌀{nom:g} {e['it']} → ±{T / 2.0:.4f}"
+
+    def _refresh_btns(self):
+        r = self.t.currentRow()
+        while self.btnrow.count():
+            w = self.btnrow.takeAt(0)
+            if w.widget() is not None:
+                w.widget().deleteLater()
+        if r < 0 or r >= len(self._entries()):
+            self.lab_prev.setText("选中条目后点下方按钮填入。")
+            return
+        e = self._entries()[r]
+        acts = ([{"txt": z[0], "idx": i} for i, z in enumerate(e.get("zones", []))]
+                or ([{"txt": f"填入 ±{e['sym']:g}", "idx": 0}] if "sym" in e
+                    else [{"txt": f"填入 ±{e['it']}/2", "idx": 0}]))
+        prevs = []
+        for a in acts:
+            b = QPushButton(a["txt"])
+            b.setObjectName("Mini")
+            try:
+                es, ei, txt = self._calc(e, a["idx"])
+                b.setToolTip(txt)
+                prevs.append(f"{a['txt']}：{txt}")
+                b.clicked.connect(lambda _=False, ee=e, ii=a["idx"],
+                                  p=(es, ei): self._apply(ee, ii, p))
+            except (DesignError, ValueError) as ex:
+                b.setEnabled(False)
+                b.setToolTip(str(ex))
+                prevs.append(f"{a['txt']}：无法换算（{ex}）")
+            self.btnrow.addWidget(b)
+        self.btnrow.addStretch(1)
+        self.lab_prev.setText("；".join(prevs))
+
+    def _apply(self, e: dict, idx: int, band: tuple[float, float]):
+        r = self.row
+        if not (0 <= r < len(STATE.links)):
+            return
+        l = STATE.links[r]
+        l["es"], l["ei"] = float(band[0]), float(band[1])
+        if e.get("set_nominal") and "zones" in e:
+            nomv = e["zones"][idx][2]
+            if nomv is not None:
+                l["nominal"] = float(nomv)
+        self.page._fill()
+        self.page.table.selectRow(r)
+        self.page.recalc()
+        self.in_nom.set_value(l["nominal"])
+        self.lab_status.setText(
+            f"已填入 {l.get('no', '')}：上 {l['es']:+.4f} / 下 {l['ei']:+.4f}"
+            f"（基本尺寸 {l['nominal']:g}）")
 
 
 # =====================================================================
@@ -1622,7 +1944,8 @@ HELP_HTML = """
 仍然应当用极值法保证 100% 互换。</p>
 
 <h2>计算方法</h2>
-<p><b>① 封闭环基本尺寸</b>：N₀ = Σ ξᵢ·Aᵢ，ξ 为传递系数（增环 +1 / 减环 −1）。</p>
+<p><b>① 封闭环基本尺寸</b>：N₀ = Σ ξᵢ·Aᵢ，ξ 为传递系数（增环 +1 / 减环 −1；
+斜面、投影等非平行环可在 ξ 下拉里显式指定 ±0.866 / ±0.707 / ±0.577 / ±0.5）。</p>
 <p><b>② 极值法 WC</b>：T₀ = Σ Tᵢ，
 ES₀ = Σ ξᵢΔᵢ + T₀/2，EI₀ = Σ ξᵢΔᵢ − T₀/2，其中 Δᵢ 为各环中间偏差。</p>
 <p><b>③ 统计法 RSS / 概率法</b>：σᵢ = kᵢ·Tᵢ/6，σ₀ = √(Σ ξᵢ²σᵢ²)，T₀ = 6σ₀。</p>
@@ -1642,6 +1965,11 @@ k 的定义是 σ = k·T/6，因此正态分布 k = 1（即 T = 6σ）。</p>
 <li><b>尺寸链计算</b>页：填各组成环的基本尺寸与上下偏差，指定增环 / 减环；
 在「封闭环要求」里填上允许的偏差带（例如上偏差 0.25、下偏差 −0.25）。
 <b>目标值留空</b>表示按算出的封闭环名义值取偏差带——这是最常用的提法。</li>
+<li><b>不用手查表</b>：点工具条上的<b>「标准选取…」</b>，弹窗里按分类直接选——
+常用配合（H7/g6 等）、按加工方式选 IT（车/铣/磨/钻/冲…）、标准件（轴承/键/销/
+GB/T 5277 螺栓通孔）、PCB 孔、连接器接触件——选中后一键把上、下偏差填入选中环。</li>
+<li><b>非平行环</b>：斜面、投影方向的环把「ξ」下拉从「自动」改成显式系数
+（cos30°=0.866、cos45°=0.707、tan30°≈0.577、cos60°=0.5，含正负）。</li>
 <li>看结果卡的<b>极值法 / 统计法</b>两个数，以及 Ppk 与合格率是否达标。
 「各环贡献率排序」里排第一的就是<b>主导环</b>，优化先动它。</li>
 <li><b>公差分配</b>页：填封闭环公差 T₀，选分配方法，得到各环推荐公差与 IT 等级，
@@ -1655,6 +1983,10 @@ k 的定义是 σ = k·T/6，因此正态分布 k = 1（即 T = 6σ）。</p>
 <tr><td class="k">等公差等级法</td><td class="v">就近归入标准 IT 等级，累积值与目标必有差额</td></tr>
 <tr><td class="k">自动判增减环</td><td class="v">需要先填封闭环目标值，否则无从反解</td></tr>
 <tr><td class="k">分布状态</td><td class="v">极值法不受影响，只影响概率法与仿真</td></tr>
+<tr><td class="k">标准选取</td><td class="v">弹窗里的配合 / IT / 通孔值按选中环的基本尺寸换算；
+PCB 与连接器一栏是行业常规能力值，各家厂会有差异，重要场合以你的供应商实测为准</td></tr>
+<tr><td class="k">显式 ξ 与增减环</td><td class="v">切增环/减环会把 ξ 清回自动 ±1；
+「自动判增减环」也会清空全部显式 ξ</td></tr>
 <tr><td class="k">热膨胀</td><td class="v">勾选后按 20 ℃ 基准修正，各环 α 需自行填对</td></tr>
 </table>
 
