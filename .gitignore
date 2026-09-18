@@ -8,8 +8,9 @@ venv/
 env/
 
 # ---- PyInstaller ----
-# build/ 是中间产物（含 35 MB 的 .pkg），不入库；成品在 dist/
-build/
+# build* 是中间产物（含 35 MB 的 .pkg），不入库；成品在 dist/
+# （build2/ 等是沙箱里为了绕开删除限制临时换的 workpath，同样排除）
+build*/
 
 # ---- 编辑器 / 系统 ----
 .vscode/

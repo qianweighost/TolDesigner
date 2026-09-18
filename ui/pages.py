@@ -582,7 +582,7 @@ _FORMAT_TIP = ("公差带代号，如 H7 / f6 / js6（可带直径，如 φ50H7�
 
 _LINK_COLS = ["编号", "名称", "基本尺寸\nmm", "上偏差\nmm", "下偏差\nmm",
               "环型", "分布状态", "公差\nmm", "ξ", "贡献率\n(统计法)"]
-_LINK_W = [58, 108, 84, 84, 84, 62, 96, 78, 40, 86]
+_LINK_W = [58, 108, 84, 84, 84, 80, 140, 78, 40, 92]
 
 
 class TolPage(QWidget):
@@ -693,7 +693,8 @@ class TolPage(QWidget):
         hh.setStretchLastSection(True)
         for i, wd in enumerate(_LINK_W):
             self.table.setColumnWidth(i, wd)
-        self.table.setMinimumHeight(200)
+        # 不设 setMinimumHeight：行数可增减，高度交给 fit_table 按实际行数收放，
+        # 否则 5 行时（表头 57 + 5×30 = 211 px > 200）末行被截、冒出内部滚动条。
         self.table.cellChanged.connect(self._on_cell)
         tcard.add(self.table)
         lay.addWidget(tcard)
@@ -790,6 +791,8 @@ class TolPage(QWidget):
             cell(t, r, 8, "", align="c")
             cell(t, r, 9, "—", align="r")
         t.blockSignals(False)
+        # 行数变了（增/删/移动/整表重建）都要重算高度，保证所有行直接可见、不出内部滚动条
+        fit_table(t, cap=720)
 
     def _fill_computed(self, res):
         """把算出来的「公差 / 传递系数 ξ / 贡献率」回填到表格的只读列。
@@ -844,7 +847,6 @@ class TolPage(QWidget):
             elif c == 1:
                 l["name"] = txt
             elif c in (2, 3, 4):
-                l["[" + "" + "]"] = None  # 占位，见下方真实赋值
                 v = float(txt.replace("，", "").replace(",", "") or 0)
                 l[{2: "nominal", 3: "es", 4: "ei"}[c]] = v
         except ValueError:

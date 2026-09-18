@@ -543,6 +543,44 @@ def test_ui():
         # 能跑到这里就说明没锁死，再确认一次结果仍在
         check_true("回填后结果依然有效（未自激死循环）", tol._res is not None)
 
+        # ---- 组成环表本体：所有行直接可见、无内部滚动条（水平/垂直都不要）----
+        from PySide6.QtGui import QFontMetrics  # noqa: E402
+        from ui.pages import _LINK_COLS  # noqa: E402
+        win.tabs.setCurrentIndex(0)
+        for _ in range(8):
+            app.processEvents()
+        lt = tol.table
+        need_h = (lt.horizontalHeader().sizeHint().height()
+                  + sum(lt.rowHeight(r) for r in range(lt.rowCount())))
+        check_true("组成环表高度装下所有行", lt.height() >= need_h,
+                   f"（高 {lt.height()} / 需 {need_h}，{lt.rowCount()} 行）")
+        check_true("组成环表无垂直滚动条", lt.verticalScrollBar().maximum() == 0,
+                   f"（滚动上限 {lt.verticalScrollBar().maximum()}）")
+        check_true("组成环表无水平滚动条",
+                   lt.horizontalScrollBar().maximum() == 0,
+                   f"（合计列宽 "
+                   f"{sum(lt.columnWidth(i) for i in range(lt.columnCount()))}"
+                   f" / 视口 {lt.viewport().width()}）")
+        # 每列宽度必须容纳「表头文字 / 单元格内容 / 下拉框」三者的最大值，
+        # 否则出现省略号或下拉框箭头被裁（实测：环型 62→需 76、分布状态 96→需 102）
+        hfm = QFontMetrics(lt.horizontalHeader().font())
+        vfm = QFontMetrics(lt.font())
+        bad = []
+        for i, label in enumerate(_LINK_COLS):
+            need = max((hfm.horizontalAdvance(x) for x in label.split("\n")),
+                       default=0) + 26
+            for r in range(lt.rowCount()):
+                w = lt.cellWidget(r, i)
+                if w is not None:
+                    need = max(need, w.sizeHint().width() + 8)
+                it = lt.item(r, i)
+                if it is not None:
+                    need = max(need, vfm.horizontalAdvance(it.text()) + 20)
+            if lt.columnWidth(i) + 1 < need:
+                bad.append(f"{label.splitlines()[0]} 需{need}/给{lt.columnWidth(i)}")
+        check_true("组成环表各列宽度足够（文字与下拉框不被裁）", not bad,
+                   "；".join(bad))
+
         # ---- 公差仿真页 ----
         sim = pages[1]
         check("随机种子按整数显示", sim.in_seed.edit.text(), "20260918")
