@@ -1,0 +1,5 @@
+# 运行依赖
+PySide6-Essentials>=6.6,<7
+
+# 打包依赖（可选，只在需要生成 exe 时安装）
+# pyinstaller>=6.0
