@@ -494,13 +494,20 @@ def _capability(mu: float, sigma: float, low: float, high: float) -> dict:
 
 
 def analyze(links: list[dict], target: dict | None = None,
-            use_thermal: bool = False) -> dict:
+            use_thermal: bool = False, n_sigma: float = 6.0) -> dict:
     """尺寸链正算（公差分析）。
 
     links  : 组成环列表（只有 enabled=True 的参与计算）
     target : 封闭环要求 {"nominal":, "es":, "ei":}；也可给 None
+    n_sigma: 统计法评估带宽的 σ 倍数（华为表格口径为 6σ，即 99.73%）。
+             σ₀ 的定义不变（单环公差带 = 6σ，与华为表一致），
+             改变的只是合成公差带取 n·σ₀：选小值（如 ±4σ）公差带更紧、
+             废品率上升；选大值更保守。
     返回    : 含 wc / rss 两套结果、贡献率、判定、建议的字典
     """
+    n_sigma = float(n_sigma)
+    if not (2.0 <= n_sigma <= 10.0):
+        raise DesignError("统计法评估带宽 n 必须在 2 ~ 10 个 σ 之间")
     act = [l for l in links if l.get("enabled", True)]
     if not act:
         raise DesignError("至少需要一个参与计算的组成环")
@@ -520,11 +527,12 @@ def analyze(links: list[dict], target: dict | None = None,
         rows.append({**l, **c})
 
     sigma0 = math.sqrt(sum_var) / 6.0
-    T_rss = 6.0 * sigma0
+    T_rss = n_sigma * sigma0
     d0_rss = d0_wc + sum_shift
 
     wc = _summarize(sum_T, d0_wc, N0, None)
     rss = _summarize(T_rss, d0_rss, N0, sigma0)
+    rss["n_sigma"] = n_sigma
 
     # ---- 贡献率 ----
     tot_T = sum_T or 1.0
@@ -552,6 +560,7 @@ def analyze(links: list[dict], target: dict | None = None,
             f"共 {n} 个累积尺寸（≥4），按华为口径建议用统计法 RSS 校核"),
         "contrib": contrib,
         "use_thermal": use_thermal,
+        "n_sigma": n_sigma,
     }
 
     # ---- 与封闭环要求比对 ----

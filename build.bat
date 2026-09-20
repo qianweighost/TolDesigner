@@ -9,26 +9,10 @@ echo ============================================================
 rem 先按同一套画法生成 app.ico（exe 文件图标 + 窗口图标保持一致）
 python "tools\make_icon.py" "app.ico"
 
-rem 注意：不要排除 PySide6.QtSvg —— 页眉的 GitHub / 地球图标由它渲染
-set EXCLUDES=--exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick ^
---exclude-module PySide6.QtQuickWidgets --exclude-module PySide6.QtQuickControls2 ^
---exclude-module PySide6.QtNetwork --exclude-module PySide6.QtSql ^
---exclude-module PySide6.QtTest --exclude-module PySide6.QtDBus ^
---exclude-module PySide6.QtDesigner --exclude-module PySide6.QtHelp ^
---exclude-module PySide6.QtUiTools --exclude-module PySide6.QtOpenGL ^
---exclude-module PySide6.QtOpenGLWidgets --exclude-module PySide6.QtPdf ^
---exclude-module PySide6.QtPdfWidgets --exclude-module PySide6.QtSpatialAudio ^
---exclude-module PySide6.QtSerialPort --exclude-module PySide6.QtStateMachine ^
---exclude-module PySide6.QtXml --exclude-module PySide6.QtConcurrent ^
---exclude-module PySide6.QtPrintSupport --exclude-module PySide6.QtSvgWidgets ^
---exclude-module PySide6.QtWebSockets ^
---exclude-module tkinter --exclude-module unittest --exclude-module pydoc
-
-pyinstaller --noconfirm --clean --windowed --onefile ^
-  --name "尺寸链公差分析计算器" ^
-  --icon "app.ico" ^
-  %EXCLUDES% ^
-  app.py
+rem 用 spec 打包：排除清单、图标、文件名都在 spec 里维护，
+rem 成品文件名自动带版本号（spec 从 app.py 读 APP_VERSION），
+rem 产出 dist\尺寸链公差分析计算器-v<版本>.exe
+pyinstaller --noconfirm --clean "尺寸链公差分析计算器.spec"
 
 echo.
 echo 打包完成，输出目录： dist\

@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
+import base64
 import datetime
 import html
 import math
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QBuffer, QCoreApplication, QIODevice, Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
                                QComboBox, QDialog, QFileDialog, QFrame,
@@ -42,6 +43,7 @@ class ChainState:
         self.links: list[dict] = default_links()
         self.target = {"nominal": "", "es": 0.25, "ei": -0.25}
         self.use_thermal = False
+        self.n_sigma = 6.0
         self.project = {"name": "L20 浇灌机 传动装配", "code": "TA-2026-001",
                         "author": "", "note": ""}
 
@@ -55,7 +57,8 @@ class ChainState:
         return {"nominal": (n or None), "es": es, "ei": ei}
 
     def result(self):
-        return analyze(self.links, self.target_or_none(), self.use_thermal)
+        return analyze(self.links, self.target_or_none(), self.use_thermal,
+                       n_sigma=self.n_sigma)
 
     def active(self):
         return [l for l in self.links if l.get("enabled", True)]
@@ -85,7 +88,8 @@ DOC_FOOTER_DEFAULT = """标准依据
 
 def report_text(title: str, meta: list[tuple[str, str]],
                 sections: list[tuple[str, list[tuple[str, str]]]],
-                warnings: list[str], notes: list[str]) -> str:
+                warnings: list[str], notes: list[str],
+                images: list[tuple[str, bytes]] | None = None) -> str:
     L = ["=" * 68, f"        {title}", "=" * 68]
     L.append(f"生成时间：{datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
     for k, v in meta:
@@ -95,6 +99,9 @@ def report_text(title: str, meta: list[tuple[str, str]],
         L.append(f"【{sec_title}】")
         for k, v in rows:
             L.append(f"  {k}：{v}")
+    for cap, _png in (images or []):
+        L.append("")
+        L.append(f"【图】{cap}（文本版省略图形，请查看 HTML 版报告）")
     L.append("")
     L.append("【校核结论】")
     if warnings:
@@ -112,7 +119,8 @@ def report_text(title: str, meta: list[tuple[str, str]],
 
 def report_html(title: str, meta: list[tuple[str, str]],
                 sections: list[tuple[str, list[tuple[str, str]]]],
-                warnings: list[str], notes: list[str]) -> str:
+                warnings: list[str], notes: list[str],
+                images: list[tuple[str, bytes]] | None = None) -> str:
     esc = html.escape
 
     def tbl(rows):
@@ -124,6 +132,15 @@ def report_html(title: str, meta: list[tuple[str, str]],
                     for k, v in meta)
     body = "".join(f"<h2>{i}. {esc(t)}</h2>{tbl(rows)}"
                    for i, (t, rows) in enumerate(sections, start=1))
+    # 图表以 base64 PNG 内嵌，单文件即可离线查看、转发不失真
+    figs = ""
+    if images:
+        parts = []
+        for i, (cap, png) in enumerate(images, start=1):
+            b64 = base64.b64encode(png).decode("ascii")
+            parts.append(f"<h2>{len(sections) + i}. {esc(cap)}</h2>"
+                         f"<img src='data:image/png;base64,{b64}' alt='{esc(cap)}'>")
+        figs = "".join(parts)
     warn = "".join(f"<li class='w'>{esc(w)}</li>" for w in warnings) \
         or "<li class='o'>各项校核均在推荐范围内。</li>"
     notes_html = f"<ul>{''.join(f'<li>{esc(n)}</li>' for n in notes)}</ul>" if notes else ""
@@ -144,6 +161,8 @@ def report_html(title: str, meta: list[tuple[str, str]],
          border-radius:5px; list-style:none; }}
  li.o {{ color:#0B7A3C; background:#F1FBF5; padding:6px 10px; border-radius:5px;
          list-style:none; }}
+ img {{ max-width:100%; height:auto; border:1px solid #E3E7ED; border-radius:6px;
+        margin:4px 0 10px; }}
  .meta td {{ font-weight:400; }}
  footer {{ margin-top:34px; padding-top:14px; border-top:1px solid #E3E7ED;
            color:#7A8794; font-size:11.5px; white-space:pre-wrap; }}
@@ -152,6 +171,7 @@ def report_html(title: str, meta: list[tuple[str, str]],
 <p style="color:#7A8794;font-size:12.5px">生成时间：{datetime.datetime.now():%Y-%m-%d %H:%M:%S}</p>
 <table class="meta">{metas}</table>
 {body}
+{figs}
 <h2>校核结论</h2>
 <ul>{warn}</ul>
 {notes_html}
@@ -159,8 +179,20 @@ def report_html(title: str, meta: list[tuple[str, str]],
 </body></html>"""
 
 
+def grab_widget_png(w) -> bytes:
+    """把控件当前画面渲染成 PNG 字节。grab() 前先冲一遍布局事件，
+    否则刚改完数据还没重绘时会截到旧图。"""
+    for _ in range(6):
+        QCoreApplication.processEvents()
+    pix = w.grab()
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    pix.save(buf, "PNG")
+    return bytes(buf.data())
+
+
 def save_report(parent, title: str, default_name: str, meta, sections,
-                warnings, notes):
+                warnings, notes, images: list[tuple[str, bytes]] | None = None):
     if not sections:
         QMessageBox.warning(parent, "无可导出内容", "请先完成一次有效计算。")
         return
@@ -171,9 +203,10 @@ def save_report(parent, title: str, default_name: str, meta, sections,
     if not path:
         return
     try:
-        content = (report_text(title, meta, sections, warnings, notes)
-                   if path.lower().endswith(".txt")
-                   else report_html(title, meta, sections, warnings, notes))
+        if path.lower().endswith(".txt"):
+            content = report_text(title, meta, sections, warnings, notes, images)
+        else:
+            content = report_html(title, meta, sections, warnings, notes, images)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
     except OSError as e:
@@ -582,8 +615,27 @@ _FORMAT_TIP = ("公差带代号，如 H7 / f6 / js6（可带直径，如 φ50H7�
                "请直接填上/下偏差。")
 
 _LINK_COLS = ["编号", "名称", "基本尺寸\nmm", "上偏差\nmm", "下偏差\nmm",
-              "环型", "分布状态", "公差\nmm", "ξ", "贡献率\n(统计法)"]
-_LINK_W = [58, 108, 84, 84, 84, 80, 140, 78, 124, 92]
+              "环型", "分布状态", "公差\nmm", "传递系数\nξ", "贡献率\n(统计法)"]
+_LINK_W = [58, 108, 84, 84, 84, 80, 140, 78, 124, 110]
+
+# 各列表头的悬浮说明（悬停即弹出，不用查帮助页）
+_LINK_TIPS = {
+    "编号": "组成环编号（A1、A2…），报告与贡献率排序按此显示",
+    "名称": "零件或尺寸的名称，如「活塞」「壁厚」",
+    "基本尺寸\nmm": "该环的名义尺寸。换算公差带代号（如 H7）时按此值查表",
+    "上偏差\nmm": "上极限偏差 ES = 最大极限尺寸 − 基本尺寸，可填 +0.05 或 0.05",
+    "下偏差\nmm": "下极限偏差 EI = 最小极限尺寸 − 基本尺寸，负值带负号",
+    "环型": "增环：该环变大 → 封闭环变大；减环反之。\n拿不准可先填封闭环目标值再点「自动判增减环」",
+    "分布状态": "该环尺寸的实际分布（只影响统计法与蒙特卡洛仿真，极值法不使用）。\n批量机加工通常按「正态分布」",
+    "公差\nmm": "公差带全宽 T = 上偏差 − 下偏差（只读，改偏差后自动更新）",
+    "传递系数\nξ": "传递系数 ξ：该环变化 1 mm 时封闭环变化多少。\n"
+         "· 自动：按增/减环取 ±1（平行尺寸链，绝大多数场景）\n"
+         "· 显式选 0.866 / 0.707 等：斜面、锥面、投影方向的环按几何关系取，\n"
+         "  例如与封闭环方向成 30° 的滑块位移取 cos30° = +0.866。\n"
+         "选中后环型随 ξ 符号联动；切回增/减环会恢复自动 ±1",
+    "贡献率\n(统计法)": "该环方差占封闭环总方差的比例（σ₀² 中它占多少）。\n"
+                     "占比最大的就是主导环，想收紧总公差先收紧它",
+}
 
 # 传递系数 ξ 的可选项：第 0 项「自动」= 按增/减环取 ±1；
 # 其余为显式系数（斜面、投影等非平行环：cos30°=0.866、cos45°=0.707、
@@ -695,12 +747,21 @@ class TolPage(QWidget):
 
         self.table = QTableWidget(0, len(_LINK_COLS))
         self.table.setHorizontalHeaderLabels(_LINK_COLS)
+        for i, c in enumerate(_LINK_COLS):
+            it = self.table.horizontalHeaderItem(i)
+            if it is not None and c in _LINK_TIPS:
+                it.setToolTip(_LINK_TIPS[c])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         hh = self.table.horizontalHeader()
+        # 列宽策略：数字列定宽（Fixed），「名称」列吃掉全部余量（Stretch）。
+        # 之前是 stretchLastSection，窗口一宽贡献率列就独吞几百像素空白，
+        # 前面数字列反而显得挤——余量给名称列才合理。
         hh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        hh.setStretchLastSection(True)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setStretchLastSection(False)
+        hh.setMinimumSectionSize(56)
         for i, wd in enumerate(_LINK_W):
             self.table.setColumnWidth(i, wd)
         # 不设 setMinimumHeight：行数可增减，高度交给 fit_table 按实际行数收放，
@@ -733,6 +794,23 @@ class TolPage(QWidget):
         for m in (self.m_nom, self.m_wc, self.m_rss, self.m_ppk):
             mrow.addWidget(m, 1)
         rcard.add_layout(mrow)
+        srow = QHBoxLayout()
+        srow.setSpacing(6)
+        sl = QLabel("统计法评估带宽")
+        sl.setToolTip("统计法合成公差带取 n·σ₀（σ₀ 的定义固定为单环 T=6σ，\n"
+                      "与华为表格口径一致）。n 越小公差带越紧、预期废品率越高；\n"
+                      "±6σ 对应 99.73% 合格（3.4 PPM），是最常用的默认口径。")
+        self.cb_nsigma = QComboBox()
+        self.cb_nsigma.addItems(["±6σ（默认，华为表格口径）", "±5σ（99.99994%）",
+                                 "±4σ（99.9937%）", "±3σ（99.73%）",
+                                 "±8σ（更保守）"])
+        self.cb_nsigma.setCurrentIndex(0)
+        self.cb_nsigma.setToolTip(sl.toolTip())
+        self.cb_nsigma.currentIndexChanged.connect(self._on_nsigma)
+        srow.addWidget(sl)
+        srow.addWidget(self.cb_nsigma)
+        srow.addStretch(1)
+        rcard.add_layout(srow)
 
         self.rows = RowList(key_w=150)
         rcard.add(self.rows)
@@ -1005,6 +1083,10 @@ class TolPage(QWidget):
         STATE.use_thermal = self.in_thermal.is_checked()
         self.recalc()
 
+    def _on_nsigma(self, idx: int):
+        STATE.n_sigma = (6.0, 5.0, 4.0, 3.0, 8.0)[max(0, min(idx, 4))]
+        self.recalc()
+
     def _kick(self):
         self._timer.start()
 
@@ -1056,9 +1138,11 @@ class TolPage(QWidget):
                       f"{w['es']:+.3f}/{w['ei']:+.3f}", "ok" if rec == "wc" else "na",
                       f"T = {w['T']:.4f} mm（ΣTᵢ）"
                       + ("　← 建议口径" if rec == "wc" else ""))
+        ns = s.get("n_sigma", 6.0)
+        self.m_rss.name.setText(f"统计法 RSS ±{ns:g}σ")
         self.m_rss.set(f"±{s['es']:.4f}" if s["es"] == -s["ei"] else
                        f"{s['es']:+.3f}/{s['ei']:+.3f}", "ok" if rec == "rss" else "na",
-                       f"T = {s['T']:.4f} mm（√ΣTᵢ²）"
+                       f"T = {s['T']:.4f} mm = {ns:g}·σ₀"
                        + ("　← 建议口径" if rec == "rss" else ""))
 
         tgt = res.get("target")
@@ -1094,7 +1178,8 @@ class TolPage(QWidget):
         self.rows.add("标准差 σ₀", f"{s['sigma']:.6f} mm")
         self.rows.add("±3σ 范围", f"{s['dmid'] - 3 * s['sigma']:+.6f} ~ "
                                 f"{s['dmid'] + 3 * s['sigma']:+.6f} mm")
-        self.rows.add("6σ = T（正态假设）", f"{6 * s['sigma']:.6f} mm")
+        self.rows.add(f"评估带宽（±{ns:g}σ）", f"{s['T']:.6f} mm"
+                       + ("（华为表格默认口径）" if ns == 6.0 else ""))
         if tgt:
             self.rows.add_sep()
             self.rows.add("【与设计要求比对】", "", bold=True)
@@ -1174,6 +1259,9 @@ class TolPage(QWidget):
                 ("图号 / 编号", STATE.project["code"] or "—"),
                 ("设计 / 校核", STATE.project["author"] or "—"),
                 ("计算方法", "极值法 WC + 统计法 RSS（华为内部《公差分析》口径）"),
+                ("统计法评估带宽", f"±{res.get('n_sigma', 6.0):g}σ"
+                                  + ("（华为表格默认口径）" if res.get("n_sigma", 6.0) == 6.0
+                                     else "，σ₀ 按单环 T=6σ 定义不变")),
                 ("热膨胀修正", "启用" if res["use_thermal"] else "未启用")]
         sec = []
         sec.append(("封闭环要求", [
@@ -1197,6 +1285,8 @@ class TolPage(QWidget):
             ("极限尺寸范围", f"{w['min']:.6g} ~ {w['max']:.6g} mm"),
         ]))
         sec.append(("统计法 RSS / 概率法（≥4 个累积尺寸推荐）", [
+            ("评估带宽", f"±{s.get('n_sigma', 6.0):g}σ"
+                         + ("（华为表格默认口径）" if s.get("n_sigma", 6.0) == 6.0 else "")),
             ("公差带全宽 T₀", f"{s['T']:.6f} mm"),
             ("上偏差 ES₀", f"{s['es']:+.6f} mm"),
             ("下偏差 EI₀", f"{s['ei']:+.6f} mm"),
@@ -1225,8 +1315,18 @@ class TolPage(QWidget):
                 if not res["verdict"][key]["ok"]:
                     warns.append(f"{name}判定超差，详见「与设计要求比对」。")
         notes = [res["recommend_reason"]]
+        images = []
+        for cap, wdg in (("尺寸链简图", self.d_chain),
+                         ("公差带图", self.d_band),
+                         ("各环贡献率图", self.d_contrib)):
+            try:
+                png = grab_widget_png(wdg)
+                if png:
+                    images.append((cap, png))
+            except Exception:
+                pass  # 图渲染失败不阻塞报告导出
         save_report(self, "尺寸链公差分析报告", "尺寸链公差分析",
-                    meta, sec, warns, notes)
+                    meta, sec, warns, notes, images)
 
 
 # =====================================================================
@@ -1948,7 +2048,10 @@ HELP_HTML = """
 斜面、投影等非平行环可在 ξ 下拉里显式指定 ±0.866 / ±0.707 / ±0.577 / ±0.5）。</p>
 <p><b>② 极值法 WC</b>：T₀ = Σ Tᵢ，
 ES₀ = Σ ξᵢΔᵢ + T₀/2，EI₀ = Σ ξᵢΔᵢ − T₀/2，其中 Δᵢ 为各环中间偏差。</p>
-<p><b>③ 统计法 RSS / 概率法</b>：σᵢ = kᵢ·Tᵢ/6，σ₀ = √(Σ ξᵢ²σᵢ²)，T₀ = 6σ₀。</p>
+<p><b>③ 统计法 RSS / 概率法</b>：σᵢ = kᵢ·Tᵢ/6，σ₀ = √(Σ ξᵢ²σᵢ²)。
+合成公差带 T₀ = <b>n·σ₀</b>，n 默认取 6（华为表格口径），可在结果卡
+「统计法评估带宽」里改选 ±3σ ~ ±8σ：n 越小公差带越紧、对超差的判定越严；
+无论 n 取多少，σ₀ 本身不变，Cp / Ppk 的定义也始终是 6σ 口径。</p>
 <p><b>④ 中间偏差</b>：Δ₀ = Σ ξᵢ·(Δᵢ + eᵢ·Tᵢ/2)，其中 eᵢ 为相对不对称系数。</p>
 <p><b>⑤ 制程能力</b>：Cp = (USL−LSL)/(6σ₀)，
 Ppk = min(USL−μ₀, μ₀−LSL)/(3σ₀)，σ 水平 = 3·Ppk + 1.5。</p>
@@ -1987,6 +2090,10 @@ GB/T 5277 螺栓通孔）、PCB 孔、连接器接触件——选中后一键把
 PCB 与连接器一栏是行业常规能力值，各家厂会有差异，重要场合以你的供应商实测为准</td></tr>
 <tr><td class="k">显式 ξ 与增减环</td><td class="v">切增环/减环会把 ξ 清回自动 ±1；
 「自动判增减环」也会清空全部显式 ξ</td></tr>
+<tr><td class="k">统计法评估带宽</td><td class="v">默认 ±6σ（华为表格口径，σ₀ 按单环 T=6σ 定义）；
+改选 ±3σ~±8σ 只影响合成公差带与超差判定，σ₀、Cp/Ppk 不变</td></tr>
+<tr><td class="k">导出报告</td><td class="v">HTML 版内嵌尺寸链简图、公差带图、贡献率图三张图，
+单文件即可转发查看；TXT 版为纯文字（图形省略）。鼠标悬停表头可看各列说明</td></tr>
 <tr><td class="k">热膨胀</td><td class="v">勾选后按 20 ℃ 基准修正，各环 α 需自行填对</td></tr>
 </table>
 
@@ -2002,7 +2109,8 @@ PCB 与连接器一栏是行业常规能力值，各家厂会有差异，重要�
 
 <h2>快捷键与其它</h2>
 <p><b>F1</b> 直达本页。三个数据页共享同一份尺寸链：在「尺寸链计算」页改环，
-「公差仿真」「公差分配」页切过去会自动同步。报告可导出为 HTML 或 TXT。</p>
+「公差仿真」「公差分配」页切过去会自动同步。报告可导出为 HTML（内嵌计算简图、
+公差带图与贡献率图）或 TXT 纯文本。</p>
 <p class="dim">计算结果用于方案比选与初步设计，正式投产前请以最新版标准原文、
 实际加工能力（实测 Cp/Cpk）与样机验证结果复核。</p>
 """

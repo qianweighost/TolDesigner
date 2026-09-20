@@ -28,7 +28,8 @@ import traceback
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-from core.tol_core import (DIST_KEYS, HOLE_DEV, IT_GRADES, SHAFT_DEV,  # noqa: E402
+from core.tol_core import (DIST_KEYS, DesignError, HOLE_DEV, IT_GRADES,
+                           SHAFT_DEV,  # noqa: E402
                            allocate, analyze, auto_signs, default_links,
                            example_links, it_grade_for, it_segment_mean,
                            it_table, it_value, link_calc, monte_carlo,
@@ -333,6 +334,28 @@ def test_explicit_xi():
                   closing_tol=0.1, method="equal", rule="rss")
     check("分配复算保留显式 ξ",
           link_calc(al["new_links"][0])["xi"], 0.5, 1e-12)
+
+
+def test_n_sigma():
+    log("")
+    log("【11b】统计法评估带宽 n·σ 可选（华为表格默认 ±6σ）")
+    L = [new_link(no=f"A{i}", nominal=10.0 + i, es=0.05, ei=-0.05)
+         for i in range(1, 6)]
+    r6 = analyze(L)
+    check("默认 n_sigma", r6["n_sigma"], 6.0, 1e-12)
+    check("默认 T_rss = 6σ₀", r6["rss"]["T"], 6.0 * r6["rss"]["sigma"], 1e-12)
+    r4 = analyze(L, n_sigma=4.0)
+    check("n=4 记录", r4["rss"]["n_sigma"], 4.0, 1e-12)
+    check("n=4 T_rss = 4σ₀", r4["rss"]["T"], 4.0 * r4["rss"]["sigma"], 1e-12)
+    # σ₀ 与 WC 不随 n 变——变的只是评估带宽
+    check("σ₀ 不随 n 变", r4["rss"]["sigma"], r6["rss"]["sigma"], 1e-12)
+    check("WC 不随 n 变", r4["wc"]["T"], r6["wc"]["T"], 1e-12)
+    check("T(n=4) / T(n=6) = 2/3", r4["rss"]["T"] / r6["rss"]["T"], 2.0 / 3.0, 1e-12)
+    try:
+        analyze(L, n_sigma=1.0)
+        check_true("n 越界应报错", False, "（未抛异常）")
+    except DesignError:
+        check_true("n 越界应报错", True)
 
 
 # =====================================================================
@@ -650,6 +673,7 @@ def test_ui():
 
         # ---- 组成环表本体：所有行直接可见、无内部滚动条（水平/垂直都不要）----
         from PySide6.QtGui import QFontMetrics  # noqa: E402
+        from PySide6.QtWidgets import QHeaderView  # noqa: E402
         from ui.pages import _LINK_COLS  # noqa: E402
         win.tabs.setCurrentIndex(0)
         for _ in range(8):
@@ -685,6 +709,30 @@ def test_ui():
                 bad.append(f"{label.splitlines()[0]} 需{need}/给{lt.columnWidth(i)}")
         check_true("组成环表各列宽度足够（文字与下拉框不被裁）", not bad,
                    "；".join(bad))
+
+        # ---- 表头悬浮说明：用户不知道 ξ 是什么，靠 tooltip 现场教学 ----
+        tips_bad = [c for i, c in enumerate(_LINK_COLS)
+                    if not lt.horizontalHeaderItem(i).toolTip()]
+        check_true("全部表头都有悬浮说明", not tips_bad,
+                   f"（缺：{tips_bad}）")
+        check("ξ 表头写全称", lt.horizontalHeaderItem(8).text(), "传递系数\nξ")
+        check_true("名称列吃掉余量（贡献率列不再独吞空白）",
+                   lt.horizontalHeader().sectionResizeMode(1)
+                   == QHeaderView.ResizeMode.Stretch)
+        check("贡献率列定宽不再拉伸", lt.columnWidth(9), 110)
+        check_true("统计法评估带宽下拉存在",
+                   tol.cb_nsigma.currentText().startswith("±6σ"),
+                   f"（{tol.cb_nsigma.currentText()}）")
+        tol.cb_nsigma.setCurrentIndex(2)          # 切 ±4σ
+        for _ in range(6):
+            app.processEvents()
+        check("切 ±4σ 后 n_sigma 生效", tol._res["rss"]["n_sigma"], 4.0, 1e-12)
+        check("RSS 卡片标题跟随口径", tol.m_rss.name.text(), "统计法 RSS ±4σ")
+        r6 = tol._res["rss"]["sigma"]
+        check("±4σ 半带 = 2σ₀", tol._res["rss"]["T"] / 2.0, 2.0 * r6, 1e-9)
+        tol.cb_nsigma.setCurrentIndex(0)          # 恢复默认 ±6σ
+        for _ in range(6):
+            app.processEvents()
 
         # ---- 公差仿真页 ----
         sim = pages[1]
@@ -730,11 +778,26 @@ def test_ui():
                        f"滚动上限 {tb.verticalScrollBar().maximum()}）")
 
         # ---- 报告生成 ----
-        from ui.pages import report_html, report_text
+        from ui.pages import grab_widget_png, report_html, report_text
         h = report_html("测试", [("a", "b")], [("一", [("k", "v")])], [], [])
         t = report_text("测试", [("a", "b")], [("一", [("k", "v")])], [], [])
         check_true("HTML 报告非空", len(h) > 800, f"（{len(h)} 字符）")
         check_true("TXT 报告非空", len(t) > 300, f"（{len(t)} 字符）")
+
+        # ---- 报告必须带图：尺寸链 / 公差带 / 贡献率三张，base64 内嵌 ----
+        png = grab_widget_png(tol.d_chain)
+        check_true("尺寸链图可渲染成 PNG", len(png) > 2000, f"（{len(png):,} B）")
+        h2 = report_html("测试", [], [("一", [("k", "v")])], [], [],
+                         images=[("尺寸链简图", png), ("公差带图", png),
+                                 ("各环贡献率图", png)])
+        n_img = h2.count("data:image/png;base64,")
+        check("HTML 报告内嵌三张图", n_img, 3)
+        check_true("图表带标题", all(k in h2 for k in
+                                     ("尺寸链简图", "公差带图", "各环贡献率图")))
+        t2 = report_text("测试", [], [], [], [],
+                         images=[("尺寸链简图", png)])
+        check_true("TXT 版标注图形省略", "【图】尺寸链简图" in t2
+                   and "HTML 版" in t2)
 
         # ---- 报告导出链路（不落盘，只走生成分支）----
         check_true("报告含标准依据", "GB/T 1800.1-2020" in t)
@@ -760,7 +823,7 @@ def main():
     for fn in (test_huawei_example, test_sigma_table, test_it_table,
                test_deviations, test_auto_signs, test_allocate,
                test_monte_carlo, test_capability, test_thermal,
-               test_explicit_xi):
+               test_explicit_xi, test_n_sigma):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001

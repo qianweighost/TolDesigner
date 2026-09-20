@@ -1,4 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
+# 成品文件名自动带版本号：从 app.py 读 APP_VERSION（如 1.2），
+# 产出 dist/尺寸链公差分析计算器-v<版本>.exe —— 升版本只改 app.py 一处。
+import os
+import re
+
+with open(os.path.join(SPECPATH, 'app.py'), encoding='utf-8') as _f:
+    _ver = re.search(r'APP_VERSION\s*=\s*[\'"]([^\'"]+)[\'"]', _f.read()).group(1)
+EXE_NAME = f'尺寸链公差分析计算器-v{_ver}'
 
 
 a = Analysis(
@@ -22,7 +30,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='尺寸链公差分析计算器',
+    name=EXE_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

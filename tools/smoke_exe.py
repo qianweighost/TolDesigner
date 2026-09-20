@@ -19,7 +19,20 @@ import sys
 import time
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_EXE = os.path.join(_ROOT, "dist", "尺寸链公差分析计算器.exe")
+
+
+def _default_exe() -> str:
+    """dist/ 里找 尺寸链公差分析计算器-v*.exe，取最新的（文件名带版本号）。"""
+    d = os.path.join(_ROOT, "dist")
+    cands = [p for p in (os.path.join(d, f) for f in os.listdir(d))
+             if os.path.isfile(p)
+             and os.path.basename(p).startswith("尺寸链公差分析计算器")
+             and p.lower().endswith(".exe")]
+    return max(cands, key=os.path.getmtime) if cands else os.path.join(
+        d, "尺寸链公差分析计算器.exe")
+
+
+DEFAULT_EXE = _default_exe()
 
 
 def run_once(exe: str, tag: str, extra_env: dict, wait: float) -> bool:
