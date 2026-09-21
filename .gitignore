@@ -22,3 +22,6 @@ desktop.ini
 # ---- 日志 / 临时 ----
 *.log
 ~$*
+tools/out/smoke.txt
+tools/out/last_state_selftest.json
+tools/out/_persist_tmp.json

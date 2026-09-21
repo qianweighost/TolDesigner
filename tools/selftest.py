@@ -28,15 +28,25 @@ import traceback
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-from core.tol_core import (DIST_KEYS, DesignError, HOLE_DEV, IT_GRADES,
-                           SHAFT_DEV,  # noqa: E402
-                           allocate, analyze, auto_signs, default_links,
-                           example_links, it_grade_for, it_segment_mean,
-                           it_table, it_value, link_calc, monte_carlo,
-                           new_link, parse_zone, ppm_to_sigma_level,
-                           sigma_level_table, tolerance_factor)
+from core import persist  # noqa: E402
+from core.persist import clear, load, normalize, save  # noqa: E402
 
 OUT_DIR = os.path.join(_ROOT, "tools", "out")
+
+# 自检绝不能碰用户真实的「上次编辑」记录：状态文件重定向到 tools/out，
+# 并默认关掉自动存盘与自动恢复（界面冒烟要看到确定的出厂数据）。
+os.environ[persist.ENV_PATH] = os.path.join(OUT_DIR, "last_state_selftest.json")
+os.environ[persist.ENV_NO_AUTOSAVE] = "1"
+os.environ[persist.ENV_NO_RESTORE] = "1"
+
+from core.tol_core import (DEFAULT_DIST, DEFAULT_SIGMA_GRADE,  # noqa: E402
+                           DIST_KEYS, DesignError, HOLE_DEV, IT_GRADES,
+                           SHAFT_DEV, allocate, analyze, auto_signs,
+                           default_links, example_links, it_grade_for,
+                           it_segment_mean, it_table, it_value, link_calc,
+                           monte_carlo, new_link, parse_zone,
+                           ppm_to_sigma_level, sigma_level_table,
+                           tolerance_factor)
 LOG: list[str] = []
 PASS = 0
 FAIL = 0
@@ -403,6 +413,66 @@ def test_sigma_grade():
                analyze([dict(L[0], sigma_grade=None)])["links"][0]["sigma_grade"] == 3.0)
 
 
+def test_persist():
+    """上次编辑的存/读：往返一致、坏文件不崩、脏数据被清洗。"""
+    log("")
+    log("【12】上次编辑的自动恢复（状态持久化）")
+    p = os.path.join(OUT_DIR, "_persist_tmp.json")
+    L = [new_link(no="A1", name="测试环", nominal=12.5, es=0.06, ei=-0.06,
+                  sign=1, dist="uniform", sigma_grade=6.0),
+         new_link(no="A2", name="减环", nominal=4.0, es=0.03, ei=-0.03, sign=-1)]
+    payload = {"links": L,
+               "target": {"nominal": "", "es": 0.2, "ei": -0.3},
+               "use_thermal": True, "n_sigma": 5.0,
+               "project": {"name": "测试项目", "code": "T-1", "author": "qa",
+                           "note": ""},
+               "sim": {"n": 5000, "seed": 7},
+               "alloc": {"tol": 0.4, "method": "等公差法", "rule": "极值法 WC",
+                         "keep": False},
+               "tab": 3, "version": "1.4"}
+    save(payload, p)
+    check_true("状态文件已写出", os.path.exists(p))
+    d = load(p)
+    check("读回环数", len(d["links"]), 2)
+    check("逐环 σ 等级被保留", d["links"][0]["sigma_grade"], 6.0, 1e-12)
+    check("分布状态被保留", d["links"][0]["dist"], "uniform")
+    check("减环符号被保留", d["links"][1]["sign"], -1)
+    check("统一档位被保留（与逐环档解耦）", d["n_sigma"], 5.0, 1e-12)
+    check_true("热膨胀开关被保留", d["use_thermal"] is True)
+    check("封闭环上偏差被保留", d["target"]["es"], 0.2, 1e-12)
+    check("封闭环下偏差被保留", d["target"]["ei"], -0.3, 1e-12)
+    check_true("目标值留空这件事本身也要保留", d["target"]["nominal"] == "")
+    check("仿真参数被保留", d["sim"]["n"], 5000)
+    check_true("分配口径被保留", d["alloc"]["rule"] == "极值法 WC")
+    check("当前页签被保留", d["tab"], 3)
+
+    save(d, p)
+    d2 = load(p)
+    check_true("二次往返逐字段一致", normalize(d) == normalize(d2))
+
+    log("      · 坏文件 / 缺字段 / 脏数据都不能挡住启动")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("{ this is not json")
+    check_true("坏 JSON 当作无记录", load(p) is None)
+    os.remove(p)
+    check_true("文件不存在也当作无记录", load(p) is None)
+    save({"links": [{"nominal": "1,234.5", "es": "abc", "dist": "不存在的分布",
+                     "sigma_grade": 99, "enabled": "yes"},
+                    "不是字典", {"nominal": None}],
+          "n_sigma": 100, "tab": "x"}, p)
+    d3 = load(p)
+    check("非法分布回落默认", d3["links"][0]["dist"], DEFAULT_DIST)
+    check("越界 σ 等级回落默认档", d3["links"][0]["sigma_grade"],
+          DEFAULT_SIGMA_GRADE, 1e-12)
+    check("千分位逗号按全应用口径忽略", d3["links"][0]["nominal"], 1234.5, 1e-12)
+    check("非法数值归零", d3["links"][0]["es"], 0.0, 1e-12)
+    check("坏条目被丢弃（只剩 2 条合法环）", len(d3["links"]), 2)
+    check("越界统一档回落", d3["n_sigma"], DEFAULT_SIGMA_GRADE, 1e-12)
+    check("非法页签回落 0", d3["tab"], 0)
+    check_true("clear() 能删掉状态文件", clear(p) and not os.path.exists(p))
+    check_true("对不存在的文件 clear() 也算成功", clear(p))
+
+
 # =====================================================================
 # 二、示意图几何自检
 # =====================================================================
@@ -563,7 +633,7 @@ def test_diagram_geometry():
 
 def test_ui():
     log("")
-    log("【12】界面冒烟 + 截图")
+    log("【13】界面冒烟 + 截图")
     try:
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QApplication, QMessageBox
@@ -885,6 +955,45 @@ def test_ui():
         check_true("报告含标准依据", "GB/T 1800.1-2020" in t)
         check_true("报告含免责声明", "免责声明" in t)
 
+        # ---- 上次编辑：存盘 → 新建窗口 → 自动恢复 ----
+        # 用户报的原始问题就是「每次打开没有记录上次的记录」，所以这条要走真实链路：
+        # 改界面 → 存盘 → 另开一个 MainWindow → 断言界面上的值与存盘前一致。
+        log("      · 上次编辑的自动恢复（存盘 → 新窗口 → 恢复）")
+        from ui.pages import STATE as _ST
+        _ST.links[0]["name"] = "恢复测试环"
+        _ST.links[0]["sigma_grade"] = 6.0
+        tol.in_name.set_text("恢复测试项目")
+        tol.in_tes.set_value(0.11)
+        tol.in_tei.set_value(-0.11)
+        tol.in_thermal.set_checked(True)
+        tol._fill()
+        tol.recalc()
+        sim.in_n.set_value(4321)
+        alloc.in_tol.set_value(0.33)
+        alloc.in_keep.set_checked(False)
+        check_true("状态已存盘", win.save_last(force=True))
+        check_true("状态文件已生成", os.path.exists(persist.state_path()),
+                   f"（{persist.state_path()}）")
+        win2 = MainWindow(restore=True)
+        check_true("新窗口读回了历史记录", win2._restored)
+        check("工程信息已恢复", win2.p_tol.in_name.text(), "恢复测试项目")
+        check("封闭环上偏差已恢复", win2.p_tol.in_tes.value(), 0.11, 1e-12)
+        check("封闭环下偏差已恢复", win2.p_tol.in_tei.value(), -0.11, 1e-12)
+        check_true("热膨胀开关已恢复", win2.p_tol.in_thermal.is_checked())
+        check("逐环 σ 等级已恢复", STATE.links[0]["sigma_grade"], 6.0, 1e-12)
+        check("表格里的环名同步恢复", win2.p_tol.table.item(0, 1).text(),
+              "恢复测试环")
+        check("σ 等级下拉同步恢复",
+              win2.p_tol.table.cellWidget(0, 7).currentText(), "±6σ")
+        check("仿真次数已恢复", win2.p_sim.in_n.value(), 4321, 1e-12)
+        check("分配公差已恢复", win2.p_alloc.in_tol.value(), 0.33, 1e-12)
+        check_true("分配「中间偏差」勾选已恢复",
+                   not win2.p_alloc.in_keep.is_checked())
+        check_true("恢复后立即算出结果", win2.p_tol._res is not None)
+        # 关掉第二个窗口并清掉测试状态文件，别把痕迹留进用户目录
+        win2.close()
+        check_true("状态文件可清除", persist.clear())
+
         win.close()
         check_true("冒烟期间没有意外弹窗", not popups,
                    f"（{popups}）" if popups else "")
@@ -905,7 +1014,7 @@ def main():
     for fn in (test_huawei_example, test_sigma_table, test_it_table,
                test_deviations, test_auto_signs, test_allocate,
                test_monte_carlo, test_capability, test_thermal,
-               test_explicit_xi, test_sigma_grade):
+               test_explicit_xi, test_sigma_grade, test_persist):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001

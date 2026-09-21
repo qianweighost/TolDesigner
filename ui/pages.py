@@ -7,9 +7,11 @@ import base64
 import datetime
 import html
 import math
+import os
 
-from PySide6.QtCore import QBuffer, QCoreApplication, QIODevice, Qt, QTimer
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import (QBuffer, QCoreApplication, QIODevice, Qt, QTimer,
+                            QUrl)
+from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
                                QComboBox, QDialog, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel,
@@ -32,6 +34,7 @@ from core.tol_core import (ALLOC_METHODS, DEFAULT_DIST, DEFAULT_SIGMA_GRADE,
 from .diagram import BandDiagram, ChainDiagram, ContribBar, HistogramDiagram
 from .theme import (ACCENT, BAD, BORDER, CARD, DEC, INC, OK, TEXT, TEXT_DIM,
                     TEXT_MID, WARN)
+from core import persist
 
 
 # =====================================================================
@@ -1156,6 +1159,28 @@ class TolPage(QWidget):
         self._fill()
         self.recalc()
 
+    def load_from_state(self):
+        """把 STATE 里的工程信息 / 封闭环要求 / 热膨胀 / σ 等级灌回控件，再重算。
+
+        启动时恢复上次编辑必须走这条路径：recalc() 会反过来用控件值覆盖 STATE，
+        所以必须先写控件、再 recalc，否则刚读回来的数据会被空控件冲掉。
+        """
+        self.in_name.set_text(STATE.project.get("name", ""))
+        self.in_code.set_text(STATE.project.get("code", ""))
+        self.in_author.set_text(STATE.project.get("author", ""))
+        self.in_thermal.set_checked(bool(STATE.use_thermal))
+        tgt = STATE.target or {}
+        self.in_tnom.set_value(tgt.get("nominal", ""))
+        self.in_tes.set_value(tgt.get("es", 0.0))
+        self.in_tei.set_value(tgt.get("ei", 0.0))
+        # 统一 σ 等级下拉是「一次性按钮」语义，恢复时要屏蔽它的信号，
+        # 否则会把各环保留的逐环档位统统改成同一档
+        self.cb_nsigma.blockSignals(True)
+        self.cb_nsigma.setCurrentIndex(_grade_index(STATE.n_sigma))
+        self.cb_nsigma.blockSignals(False)
+        self._fill()
+        self.recalc()
+
     # ---------------- 计算与呈现 ----------------
     def recalc(self):
         STATE.target = {"nominal": self.in_tnom.value() or "",
@@ -2184,6 +2209,13 @@ PCB 与连接器一栏是行业常规能力值，各家厂会有差异，重要�
 <li><b>三维尺寸链</b>：只做线性链（传递系数 ±1）。角度链需自行折算成线性环后输入。</li>
 </ul>
 
+<h2>上次编辑会被记住</h2>
+<p>组成环、封闭环要求、工程信息、热膨胀开关、σ 等级、仿真参数、分配参数
+以及当前页签，都会<b>在关窗、切页时立刻存盘</b>，另外每 60 秒兜底存一次；
+下次打开自动恢复，不用每次从头填。</p>
+<p>历史记录存在本机的一个状态文件里（本页底部显示完整路径）。想换台电脑带走配置，
+把它拷过去即可；删掉它、或点本页的<b>「恢复出厂默认」</b>，就回到出厂的示例数据。</p>
+
 <h2>快捷键与其它</h2>
 <p><b>F1</b> 直达本页。三个数据页共享同一份尺寸链：在「尺寸链计算」页改环，
 「公差仿真」「公差分配」页切过去会自动同步。报告可导出为 HTML（内嵌计算简图、
@@ -2211,4 +2243,46 @@ class HelpPage(QWidget):
             "table{border-collapse:collapse;}"
             "ol,ul{margin-left:-18px;}")
         card.add(lab)
+
+        # ---- 历史记录（上次编辑的自动恢复）管理 ----
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.lab_path = QLabel()
+        self.lab_path.setObjectName("FieldHint")
+        self.lab_path.setWordWrap(True)
+        self.lab_path.setText(f"历史记录文件：{persist.state_path()}")
+        row.addWidget(self.lab_path, 1)
+        b_dir = QPushButton("打开所在目录")
+        b_dir.setObjectName("Mini")
+        b_dir.setToolTip("在资源管理器里定位状态文件（可直接删除，等同于恢复默认）")
+        b_dir.clicked.connect(self._open_dir)
+        b_reset = QPushButton("恢复出厂默认")
+        b_reset.setObjectName("Mini")
+        b_reset.setToolTip("清除历史记录，并把尺寸链恢复为出厂示例数据")
+        b_reset.clicked.connect(self._reset)
+        row.addWidget(b_dir)
+        row.addWidget(b_reset)
+        card.add_layout(row)
         sa.setWidget(card)
+
+    def _open_dir(self):
+        d = os.path.dirname(persist.state_path())
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+
+    def _reset(self):
+        r = QMessageBox.question(
+            self, "恢复出厂默认",
+            "将清除上次编辑的历史记录，并把尺寸链恢复为出厂示例数据。\n"
+            "当前编辑内容不会另存，确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        w = self.window()
+        if hasattr(w, "reset_to_default"):
+            w.reset_to_default()
+        QMessageBox.information(self, "已恢复", "已清除历史记录并恢复默认数据。")
