@@ -25,7 +25,7 @@ from ui.pages import (AllocPage, HelpPage, SimPage, StdPage,  # noqa: E402
                       TolPage)
 
 APP_NAME = "尺寸链公差分析计算器"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 APP_SUB = ("尺寸链正算（极值法 / 统计法） · 公差分配反算 · "
            "蒙特卡洛仿真 · 标准公差库")
 

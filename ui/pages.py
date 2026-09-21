@@ -18,9 +18,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
                                QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
 
-from core.tol_core import (ALLOC_METHODS, DEFAULT_DIST, DISTRIBUTIONS,
+from core.tol_core import (ALLOC_METHODS, DEFAULT_DIST, DEFAULT_SIGMA_GRADE,
+                           DISTRIBUTIONS,
                            DIST_KEYS, HOLE_DEV, IT_A, IT_GRADES, IT_MAX_SIZE,
-                           SHAFT_DEV, STD_TEMP, DesignError, allocate,
+                           SHAFT_DEV, SIGMA_GRADES, SIGMA_GRADE_LABELS,
+                           STD_TEMP, DesignError, allocate,
                            analyze, auto_signs, default_links, dev_for_zone,
                            dist_label, example_links, it_grade_for, it_table,
                            it_value, monte_carlo, new_link, parse_zone,
@@ -43,7 +45,9 @@ class ChainState:
         self.links: list[dict] = default_links()
         self.target = {"nominal": "", "es": 0.25, "ei": -0.25}
         self.use_thermal = False
-        self.n_sigma = 6.0
+        # σ 等级缺省值（每环可在 link["sigma_grade"] 单独覆盖）。
+        # 默认 3 = T 为 6σ 带宽，与 GB/T 5847 / 华为胶片的正态口径一致。
+        self.n_sigma = DEFAULT_SIGMA_GRADE
         self.project = {"name": "L20 浇灌机 传动装配", "code": "TA-2026-001",
                         "author": "", "note": ""}
 
@@ -615,8 +619,12 @@ _FORMAT_TIP = ("公差带代号，如 H7 / f6 / js6（可带直径，如 φ50H7�
                "请直接填上/下偏差。")
 
 _LINK_COLS = ["编号", "名称", "基本尺寸\nmm", "上偏差\nmm", "下偏差\nmm",
-              "环型", "分布状态", "公差\nmm", "传递系数\nξ", "贡献率\n(统计法)"]
-_LINK_W = [58, 108, 84, 84, 84, 80, 140, 78, 124, 110]
+              "环型", "分布状态", "σ 等级", "公差\nmm", "传递系数\nξ",
+              "贡献率\n(统计法)"]
+_LINK_W = [58, 108, 84, 84, 84, 80, 156, 92, 100, 132, 110]
+# 列索引（表格增删列时只改这里，避免散落的魔数）
+_C_NO, _C_NAME, _C_NOM, _C_ES, _C_EI = 0, 1, 2, 3, 4
+_C_SIGN, _C_DIST, _C_GRADE, _C_TOL, _C_XI, _C_SHARE = 5, 6, 7, 8, 9, 10
 
 # 各列表头的悬浮说明（悬停即弹出，不用查帮助页）
 _LINK_TIPS = {
@@ -627,6 +635,12 @@ _LINK_TIPS = {
     "下偏差\nmm": "下极限偏差 EI = 最小极限尺寸 − 基本尺寸，负值带负号",
     "环型": "增环：该环变大 → 封闭环变大；减环反之。\n拿不准可先填封闭环目标值再点「自动判增减环」",
     "分布状态": "该环尺寸的实际分布（只影响统计法与蒙特卡洛仿真，极值法不使用）。\n批量机加工通常按「正态分布」",
+    "σ 等级": "本环公差带对应「±几个 σ」，逐环可选（默认 ±3σ）。\n"
+           "· ±3σ：Tᵢ 就是 6σ 带宽，GB/T 5847 与华为胶片的标准正态口径\n"
+           "· ±4σ / ±5σ / ±6σ：该环的工艺数据比标准口径更保守（同一公差带\n"
+           "  按更宽的 σ 解读），在统计法合成里占的带宽更大\n"
+           "统计法评估带宽 ᵢ = nᵢ·σᵢ，合成 T_rss = √(Σ(ξᵢ·nᵢ·σᵢ)²)。\n"
+           "极值法 WC 不使用本列；σ₀ 与 Cp / Ppk 始终按 6σ 标准定义，也不受本列影响",
     "公差\nmm": "公差带全宽 T = 上偏差 − 下偏差（只读，改偏差后自动更新）",
     "传递系数\nξ": "传递系数 ξ：该环变化 1 mm 时封闭环变化多少。\n"
          "· 自动：按增/减环取 ±1（平行尺寸链，绝大多数场景）\n"
@@ -642,6 +656,33 @@ _LINK_TIPS = {
 # tan30°=1/√3≈0.577、cos60°=0.5，含正负）。文字必须与 f"{v:+g}" 严格一致。
 _XI_ITEMS = ["自动", "+1", "-1", "+0.866", "-0.866", "+0.707", "-0.707",
              "+0.577", "-0.577", "+0.5", "-0.5"]
+
+
+def _grade_index(v) -> int:
+    """把 σ 等级值映射成 SIGMA_GRADES 的下标（非标准值取最近一档）。"""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 0
+    return min(range(len(SIGMA_GRADES)), key=lambda i: abs(SIGMA_GRADES[i] - v))
+
+
+def grade_summary(res) -> str:
+    """把各环 σ 等级汇总成一行文字（报告 / 导出共用）。"""
+    links = res.get("links") or []
+    if not links:
+        return "—"
+    cnt: dict[float, int] = {}
+    for l in links:
+        g = float(l.get("sigma_grade", DEFAULT_SIGMA_GRADE))
+        cnt[g] = cnt.get(g, 0) + 1
+    if len(cnt) == 1:
+        g = next(iter(cnt))
+        tail = "（标准正态口径，单环 T = 6σ）" if abs(g - 3.0) < 1e-9 else ""
+        return f"全环统一 ±{g:g}σ{tail}"
+    neff = float((res.get("rss") or {}).get("n_eff", 0.0) or 0.0)
+    detail = "、".join(f"±{g:g}σ×{cnt[g]}" for g in sorted(cnt))
+    return f"逐环设定：{detail}　→ 等效 ±{neff:.4f}σ₀"
 
 
 class TolPage(QWidget):
@@ -796,13 +837,14 @@ class TolPage(QWidget):
         rcard.add_layout(mrow)
         srow = QHBoxLayout()
         srow.setSpacing(6)
-        sl = QLabel("统计法评估带宽")
-        sl.setToolTip("统计法合成公差带取 n·σ₀（σ₀ 的定义固定为单环 T=6σ，\n"
-                      "与华为表格口径一致）。n 越小公差带越紧、预期废品率越高；\n"
-                      "±6σ 对应 99.73% 合格（3.4 PPM），是最常用的默认口径。")
+        sl = QLabel("统一 σ 等级")
+        sl.setToolTip("一键把所有组成环的 σ 等级设为同一档；表格「σ 等级」列还能逐环单独改。\n"
+                      "默认 ±3σ = 该环公差带就是 6σ 带宽，GB/T 5847 与华为胶片的标准正态口径。\n"
+                      "统计法评估带宽ᵢ = nᵢ·σᵢ，合成 T_rss = √(Σ(ξᵢ·nᵢ·σᵢ)²)；\n"
+                      "σ₀ 与 Cp / Ppk 始终按 6σ 定义，不随本档位变化。")
         self.cb_nsigma = QComboBox()
-        self.cb_nsigma.addItems(["±6σ（默认，华为表格口径）", "±5σ（99.99994%）",
-                                 "±4σ（99.9937%）", "±3σ（99.73%）",
+        self.cb_nsigma.addItems(["±3σ（默认，标准正态口径）", "±4σ",
+                                 "±5σ", "±6σ（华为表格口径）",
                                  "±8σ（更保守）"])
         self.cb_nsigma.setCurrentIndex(0)
         self.cb_nsigma.setToolTip(sl.toolTip())
@@ -856,17 +898,17 @@ class TolPage(QWidget):
         for l in STATE.links:
             r = t.rowCount()
             t.insertRow(r)
-            cell(t, r, 0, str(l.get("no", "")), align="c")
-            cell(t, r, 1, str(l.get("name", "")))
-            cell(t, r, 2, f"{l['nominal']:g}", align="r")
-            cell(t, r, 3, f"{l['es']:g}", align="r")
-            cell(t, r, 4, f"{l['ei']:g}", align="r")
+            cell(t, r, _C_NO, str(l.get("no", "")), align="c")
+            cell(t, r, _C_NAME, str(l.get("name", "")))
+            cell(t, r, _C_NOM, f"{l['nominal']:g}", align="r")
+            cell(t, r, _C_ES, f"{l['es']:g}", align="r")
+            cell(t, r, _C_EI, f"{l['ei']:g}", align="r")
             cb = QComboBox()
             cb.addItems(["增环", "减环"])
             cb.setCurrentIndex(0 if int(l.get("sign", 1)) >= 0 else 1)
             cb.currentIndexChanged.connect(
                 lambda _i, rr=r: self._set_field(rr, "sign"))
-            t.setCellWidget(r, 5, cb)
+            t.setCellWidget(r, _C_SIGN, cb)
             db = QComboBox()
             db.addItems([DISTRIBUTIONS[k]["label"] for k in DIST_KEYS])
             di = DIST_KEYS.index(l.get("dist", DEFAULT_DIST)) \
@@ -874,8 +916,16 @@ class TolPage(QWidget):
             db.setCurrentIndex(di)
             db.currentIndexChanged.connect(
                 lambda _i, rr=r: self._set_field(rr, "dist"))
-            t.setCellWidget(r, 6, db)
-            cell(t, r, 7, "—", align="r")
+            t.setCellWidget(r, _C_DIST, db)
+            # σ 等级：逐环可选，默认 ±3σ（= T 为 6σ 带宽的标准正态口径）
+            nb = QComboBox()
+            nb.addItems(list(SIGMA_GRADE_LABELS))
+            nb.setCurrentIndex(_grade_index(l.get("sigma_grade")))
+            nb.setToolTip(_LINK_TIPS["σ 等级"])
+            nb.currentIndexChanged.connect(
+                lambda _i, rr=r: self._set_field(rr, "grade"))
+            t.setCellWidget(r, _C_GRADE, nb)
+            cell(t, r, _C_TOL, "—", align="r")
             xb = QComboBox()
             xb.addItems(_XI_ITEMS)
             if l.get("xi") is not None:
@@ -885,8 +935,8 @@ class TolPage(QWidget):
                           "斜面、投影等非平行环可显式选系数（cos30°=0.866 等）")
             xb.currentIndexChanged.connect(
                 lambda _i, rr=r: self._set_field(rr, "xi"))
-            t.setCellWidget(r, 8, xb)
-            cell(t, r, 9, "—", align="r")
+            t.setCellWidget(r, _C_XI, xb)
+            cell(t, r, _C_SHARE, "—", align="r")
         t.blockSignals(False)
         # 行数变了（增/删/移动/整表重建）都要重算高度，保证所有行直接可见、不出内部滚动条
         fit_table(t, cap=720)
@@ -912,9 +962,9 @@ class TolPage(QWidget):
                 hit = next((c for c in pool if str(c.get("no")) == no), None)
                 if hit is not None:
                     pool.remove(hit)
-                cell(t, i, 7, "—" if not lc else f"{lc['T']:.4f}", align="r")
+                cell(t, i, _C_TOL, "—" if not lc else f"{lc['T']:.4f}", align="r")
                 # ξ 列：第 0 项「自动」动态显示实际生效的传递系数
-                xb = t.cellWidget(i, 8)
+                xb = t.cellWidget(i, _C_XI)
                 if isinstance(xb, QComboBox):
                     xb.blockSignals(True)
                     if lk.get("xi") is None:
@@ -926,7 +976,7 @@ class TolPage(QWidget):
                         _xi = xb.findText(f"{float(lk['xi']):+g}")
                         xb.setCurrentIndex(_xi if _xi > 0 else 1)
                     xb.blockSignals(False)
-                cell(t, i, 9, "—" if hit is None
+                cell(t, i, _C_SHARE, "—" if hit is None
                      else f"{hit['share_rss'] * 100:.2f}%", align="r")
         finally:
             t.blockSignals(False)
@@ -936,9 +986,9 @@ class TolPage(QWidget):
         t.blockSignals(True)
         try:
             for i in range(t.rowCount()):
-                cell(t, i, 7, "—", align="r")
-                cell(t, i, 8, "", align="c")
-                cell(t, i, 9, "—", align="r")
+                cell(t, i, _C_TOL, "—", align="r")
+                cell(t, i, _C_XI, "", align="c")
+                cell(t, i, _C_SHARE, "—", align="r")
         finally:
             t.blockSignals(False)
 
@@ -969,7 +1019,8 @@ class TolPage(QWidget):
         if r >= len(STATE.links):
             return
         l = STATE.links[r]
-        col = {"sign": 5, "dist": 6, "xi": 8}[kind]
+        col = {"sign": _C_SIGN, "dist": _C_DIST, "grade": _C_GRADE,
+               "xi": _C_XI}[kind]
         w = self.table.cellWidget(r, col)
         if isinstance(w, QComboBox):
             if kind == "sign":
@@ -977,6 +1028,8 @@ class TolPage(QWidget):
                 l["xi"] = None                     # 切增/减环 = 回到自动 ±1
             elif kind == "dist":
                 l["dist"] = DIST_KEYS[w.currentIndex()]
+            elif kind == "grade":
+                l["sigma_grade"] = SIGMA_GRADES[w.currentIndex()]
             else:                                   # xi
                 txt = w.currentText()
                 if txt == "自动":
@@ -985,7 +1038,7 @@ class TolPage(QWidget):
                     l["xi"] = float(txt)
                     l["sign"] = 1 if l["xi"] >= 0 else -1
                     # 环型跟着符号走（屏蔽信号，避免又把 xi 清回自动）
-                    sb = self.table.cellWidget(r, 5)
+                    sb = self.table.cellWidget(r, _C_SIGN)
                     if isinstance(sb, QComboBox):
                         sb.blockSignals(True)
                         sb.setCurrentIndex(0 if l["sign"] > 0 else 1)
@@ -1084,7 +1137,11 @@ class TolPage(QWidget):
         self.recalc()
 
     def _on_nsigma(self, idx: int):
-        STATE.n_sigma = (6.0, 5.0, 4.0, 3.0, 8.0)[max(0, min(idx, 4))]
+        """统一 σ 等级：把所有组成环一次性设为同一档（表格里仍可逐环覆盖）。"""
+        STATE.n_sigma = SIGMA_GRADES[max(0, min(idx, len(SIGMA_GRADES) - 1))]
+        for l in STATE.links:
+            l["sigma_grade"] = STATE.n_sigma
+        self._fill()
         self.recalc()
 
     def _kick(self):
@@ -1138,11 +1195,15 @@ class TolPage(QWidget):
                       f"{w['es']:+.3f}/{w['ei']:+.3f}", "ok" if rec == "wc" else "na",
                       f"T = {w['T']:.4f} mm（ΣTᵢ）"
                       + ("　← 建议口径" if rec == "wc" else ""))
-        ns = s.get("n_sigma", 6.0)
-        self.m_rss.name.setText(f"统计法 RSS ±{ns:g}σ")
+        ns = s.get("n_sigma", DEFAULT_SIGMA_GRADE)
+        neff = s.get("n_eff", ns)
+        uniform = s.get("uniform_grade", True)
+        gradetag = f"±{ns:g}σ" if uniform else f"≈±{neff:.2f}σ"
+        self.m_rss.name.setText(f"统计法 RSS {gradetag}")
         self.m_rss.set(f"±{s['es']:.4f}" if s["es"] == -s["ei"] else
                        f"{s['es']:+.3f}/{s['ei']:+.3f}", "ok" if rec == "rss" else "na",
-                       f"T = {s['T']:.4f} mm = {ns:g}·σ₀"
+                       f"T = {s['T']:.4f} mm = {neff:.4g}·σ₀"
+                       + ("" if uniform else "（逐环 σ 等级不同，取等效值）")
                        + ("　← 建议口径" if rec == "rss" else ""))
 
         tgt = res.get("target")
@@ -1178,8 +1239,17 @@ class TolPage(QWidget):
         self.rows.add("标准差 σ₀", f"{s['sigma']:.6f} mm")
         self.rows.add("±3σ 范围", f"{s['dmid'] - 3 * s['sigma']:+.6f} ~ "
                                 f"{s['dmid'] + 3 * s['sigma']:+.6f} mm")
-        self.rows.add(f"评估带宽（±{ns:g}σ）", f"{s['T']:.6f} mm"
-                       + ("（华为表格默认口径）" if ns == 6.0 else ""))
+        if uniform:
+            self.rows.add("σ 等级（全环统一）",
+                          f"±{ns:g}σ　→ 评估带宽 = {ns:g}·σ₀ = {s['T']:.6f} mm")
+        else:
+            cnt = {}
+            for r_ in res.get("links") or []:
+                cnt[r_["sigma_grade"]] = cnt.get(r_["sigma_grade"], 0) + 1
+            detail = "、".join(f"±{g:g}σ×{cnt[g]}" for g in sorted(cnt))
+            self.rows.add("σ 等级（逐环不同）", detail)
+            self.rows.add("等效评估带宽", f"±{neff:.4f}σ₀ = {s['T']:.6f} mm"
+                                       f"（按 √(Σ(ξᵢ·nᵢ·σᵢ)²) 合成）")
         if tgt:
             self.rows.add_sep()
             self.rows.add("【与设计要求比对】", "", bold=True)
@@ -1259,9 +1329,7 @@ class TolPage(QWidget):
                 ("图号 / 编号", STATE.project["code"] or "—"),
                 ("设计 / 校核", STATE.project["author"] or "—"),
                 ("计算方法", "极值法 WC + 统计法 RSS（华为内部《公差分析》口径）"),
-                ("统计法评估带宽", f"±{res.get('n_sigma', 6.0):g}σ"
-                                  + ("（华为表格默认口径）" if res.get("n_sigma", 6.0) == 6.0
-                                     else "，σ₀ 按单环 T=6σ 定义不变")),
+                ("σ 等级", grade_summary(res)),
                 ("热膨胀修正", "启用" if res["use_thermal"] else "未启用")]
         sec = []
         sec.append(("封闭环要求", [
@@ -1275,7 +1343,8 @@ class TolPage(QWidget):
             (f"{l.get('no', '—')} {l.get('name', '')}".strip(),
              f"A = {l['nominal']:g} mm　{l['es']:+.4f}/{l['ei']:+.4f}　"
              f"ξ={l['xi']:+g}　{dist_label(l['dist'])}　"
-             f"k={l['k']:.2f}　e={l['e']:+.2f}")
+             f"k={l['k']:.2f}　e={l['e']:+.2f}　"
+             f"σ等级 ±{float(l.get('sigma_grade', DEFAULT_SIGMA_GRADE)):g}")
             for l in res["links"]]))
         w, s = res["wc"], res["rss"]
         sec.append(("极值法 WC（≤3 个累积尺寸推荐）", [
@@ -1285,8 +1354,9 @@ class TolPage(QWidget):
             ("极限尺寸范围", f"{w['min']:.6g} ~ {w['max']:.6g} mm"),
         ]))
         sec.append(("统计法 RSS / 概率法（≥4 个累积尺寸推荐）", [
-            ("评估带宽", f"±{s.get('n_sigma', 6.0):g}σ"
-                         + ("（华为表格默认口径）" if s.get("n_sigma", 6.0) == 6.0 else "")),
+            ("σ 等级", grade_summary(res)),
+            ("等效评估带宽", f"±{s.get('n_eff', s.get('n_sigma', DEFAULT_SIGMA_GRADE)):.4f}σ₀"
+                          f"　（T_rss = √(Σ(ξᵢ·nᵢ·σᵢ)²)）"),
             ("公差带全宽 T₀", f"{s['T']:.6f} mm"),
             ("上偏差 ES₀", f"{s['es']:+.6f} mm"),
             ("下偏差 EI₀", f"{s['ei']:+.6f} mm"),
@@ -2049,9 +2119,11 @@ HELP_HTML = """
 <p><b>② 极值法 WC</b>：T₀ = Σ Tᵢ，
 ES₀ = Σ ξᵢΔᵢ + T₀/2，EI₀ = Σ ξᵢΔᵢ − T₀/2，其中 Δᵢ 为各环中间偏差。</p>
 <p><b>③ 统计法 RSS / 概率法</b>：σᵢ = kᵢ·Tᵢ/6，σ₀ = √(Σ ξᵢ²σᵢ²)。
-合成公差带 T₀ = <b>n·σ₀</b>，n 默认取 6（华为表格口径），可在结果卡
-「统计法评估带宽」里改选 ±3σ ~ ±8σ：n 越小公差带越紧、对超差的判定越严；
-无论 n 取多少，σ₀ 本身不变，Cp / Ppk 的定义也始终是 6σ 口径。</p>
+每环的 <b>σ 等级 nᵢ</b>（表格「σ 等级」列，默认全环 ±3σ）决定该环的评估带宽 nᵢ·σᵢ，
+合成公差带 T₀ = <b>√(Σ (ξᵢ·nᵢ·σᵢ)²)</b>——只有全环档位相同时，它才等于通常写的 n·σ₀。
+默认 ±3σ 意味着 Tᵢ = 6σᵢ，是 GB/T 5847 与华为胶片的标准正态口径，日常不用去动它；
+某环改成 ±4σ / ±5σ / ±6σ 表示该环的公差按更保守的工艺数据解读，在合成里占的带宽更大。
+σ₀ 与各环档位无关，Cp / Ppk 的定义始终是 6σ 口径。</p>
 <p><b>④ 中间偏差</b>：Δ₀ = Σ ξᵢ·(Δᵢ + eᵢ·Tᵢ/2)，其中 eᵢ 为相对不对称系数。</p>
 <p><b>⑤ 制程能力</b>：Cp = (USL−LSL)/(6σ₀)，
 Ppk = min(USL−μ₀, μ₀−LSL)/(3σ₀)，σ 水平 = 3·Ppk + 1.5。</p>
@@ -2073,6 +2145,10 @@ k 的定义是 σ = k·T/6，因此正态分布 k = 1（即 T = 6σ）。</p>
 GB/T 5277 螺栓通孔）、PCB 孔、连接器接触件——选中后一键把上、下偏差填入选中环。</li>
 <li><b>非平行环</b>：斜面、投影方向的环把「ξ」下拉从「自动」改成显式系数
 （cos30°=0.866、cos45°=0.707、tan30°≈0.577、cos60°=0.5，含正负）。</li>
+<li><b>σ 等级</b>：默认全环 ±3σ（T = 6σ 的标准正态口径），一般不用改。
+只有当某个零件是按更保守的 ±4σ / ±5σ / ±6σ 数据提交时，
+才在对应行的「σ 等级」列单独上调——它会在统计法合成里占更大带宽。
+想整体切档就用结果卡的「统一 σ 等级」，一键把全环设成同一档。</li>
 <li>看结果卡的<b>极值法 / 统计法</b>两个数，以及 Ppk 与合格率是否达标。
 「各环贡献率排序」里排第一的就是<b>主导环</b>，优化先动它。</li>
 <li><b>公差分配</b>页：填封闭环公差 T₀，选分配方法，得到各环推荐公差与 IT 等级，
@@ -2090,8 +2166,9 @@ GB/T 5277 螺栓通孔）、PCB 孔、连接器接触件——选中后一键把
 PCB 与连接器一栏是行业常规能力值，各家厂会有差异，重要场合以你的供应商实测为准</td></tr>
 <tr><td class="k">显式 ξ 与增减环</td><td class="v">切增环/减环会把 ξ 清回自动 ±1；
 「自动判增减环」也会清空全部显式 ξ</td></tr>
-<tr><td class="k">统计法评估带宽</td><td class="v">默认 ±6σ（华为表格口径，σ₀ 按单环 T=6σ 定义）；
-改选 ±3σ~±8σ 只影响合成公差带与超差判定，σ₀、Cp/Ppk 不变</td></tr>
+<tr><td class="k">σ 等级</td><td class="v">逐环可选，默认全环 ±3σ（= T 为 6σ 的标准正态口径）。
+结果卡的「统一 σ 等级」是一键把全环设成同一档，设完仍可逐行微调；
+改它只影响统计法合成带宽与超差判定，极值法、σ₀、Cp/Ppk 都不变</td></tr>
 <tr><td class="k">导出报告</td><td class="v">HTML 版内嵌尺寸链简图、公差带图、贡献率图三张图，
 单文件即可转发查看；TXT 版为纯文字（图形省略）。鼠标悬停表头可看各列说明</td></tr>
 <tr><td class="k">热膨胀</td><td class="v">勾选后按 20 ℃ 基准修正，各环 α 需自行填对</td></tr>

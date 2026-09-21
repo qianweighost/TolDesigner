@@ -345,6 +345,24 @@ def zone_examples() -> list[str]:
 
 STD_TEMP = 20.0        # 标准温度 ℃（GB/T 1800.1）
 
+# σ 等级：环公差带对应「±n 个 σ」。
+#   默认 3 —— 即 T = 6σ，与 GB/T 5847、华为胶片的正态口径完全一致；
+#   某环的工艺数据不同（供应商只给 ±4σ 数据、或过程能力实测更保守）时可单独上调。
+# 每环的评估带宽 = nᵢ·σᵢ，合成 T_rss = √(Σ (ξᵢ·nᵢ·σᵢ)²)。
+DEFAULT_SIGMA_GRADE = 3.0
+SIGMA_GRADES = (3.0, 4.0, 5.0, 6.0, 8.0)
+SIGMA_GRADE_LABELS = ("±3σ", "±4σ", "±5σ", "±6σ", "±8σ")
+SIGMA_GRADE_MIN = 1.0
+SIGMA_GRADE_MAX = 10.0
+
+
+def check_sigma_grade(n: float, where: str = "") -> float:
+    n = float(n)
+    if not (SIGMA_GRADE_MIN <= n <= SIGMA_GRADE_MAX):
+        raise DesignError(
+            f"{where}σ 等级必须在 {SIGMA_GRADE_MIN:g} ~ {SIGMA_GRADE_MAX:g} 之间")
+    return n
+
 
 def new_link(no: str = "", name: str = "", nominal: float = 0.0,
              es: float = 0.0, ei: float = 0.0, sign: int = 1,
@@ -352,6 +370,7 @@ def new_link(no: str = "", name: str = "", nominal: float = 0.0,
              alpha: float = 0.0, temp: float = STD_TEMP,
              k: float | None = None, e: float | None = None,
              xi: float | None = None,
+             sigma_grade: float = DEFAULT_SIGMA_GRADE,
              note: str = "") -> dict:
     k0, e0 = dist_params(dist)
     return {"no": no, "name": name, "nominal": float(nominal),
@@ -362,6 +381,8 @@ def new_link(no: str = "", name: str = "", nominal: float = 0.0,
             "alpha": float(alpha), "temp": float(temp),
             "k": k0 if k is None else float(k),
             "e": e0 if e is None else float(e),
+            # sigma_grade：本环公差带对应的 ±nσ（默认 3 = T 为 6σ 带宽）
+            "sigma_grade": check_sigma_grade(sigma_grade),
             "note": note}
 
 
@@ -398,10 +419,17 @@ def link_calc(link: dict, use_thermal: bool = False) -> dict:
     e = float(link.get("e", 0.0))
     if k <= 0:
         raise DesignError(f"环 {link.get('no', '')} 的相对分布系数 k 必须为正")
+    sg = link.get("sigma_grade", DEFAULT_SIGMA_GRADE)
+    sg = DEFAULT_SIGMA_GRADE if sg in (None, "") else \
+        check_sigma_grade(sg, f"环 {link.get('no', '')} 的")
+    sigma = k * T / 6.0
     return {"nominal": nom, "es": es, "ei": ei, "T": T, "dmid": dmid,
             "xi": xi, "k": k, "e": e,
             "dist": link.get("dist", DEFAULT_DIST),
-            "sigma": k * T / 6.0,
+            "sigma_grade": sg,
+            "sigma": sigma,
+            # 评估带宽：本环按 ±nᵢσᵢ 参与统计法合成（nᵢ = 3 时即 Tᵢ 本身）
+            "band": sg * sigma,
             "shift": xi * e * T / 2.0}
 
 
@@ -494,20 +522,23 @@ def _capability(mu: float, sigma: float, low: float, high: float) -> dict:
 
 
 def analyze(links: list[dict], target: dict | None = None,
-            use_thermal: bool = False, n_sigma: float = 6.0) -> dict:
+            use_thermal: bool = False, n_sigma: float = DEFAULT_SIGMA_GRADE) -> dict:
     """尺寸链正算（公差分析）。
 
     links  : 组成环列表（只有 enabled=True 的参与计算）
     target : 封闭环要求 {"nominal":, "es":, "ei":}；也可给 None
-    n_sigma: 统计法评估带宽的 σ 倍数（华为表格口径为 6σ，即 99.73%）。
-             σ₀ 的定义不变（单环公差带 = 6σ，与华为表一致），
-             改变的只是合成公差带取 n·σ₀：选小值（如 ±4σ）公差带更紧、
-             废品率上升；选大值更保守。
+    n_sigma: σ 等级的缺省值（默认 3，即 T = 6σ 的标准正态口径）。
+             每个环可在 link["sigma_grade"] 里单独指定自己的 σ 等级，
+             未指定时用这里的缺省值。
+
+    统计法口径（每环独立评估带宽）
+        σᵢ = kᵢ·Tᵢ/6                     —— 单环标准差，定义不变
+        带宽ᵢ = nᵢ·σᵢ                    —— nᵢ 为该环 σ 等级（默认 3）
+        T_rss = √(Σ (ξᵢ·nᵢ·σᵢ)²)         —— 只有 nᵢ = n₀ 全体相同时才等于 n₀·σ₀
+        σ₀   = √(Σ (ξᵢ·σᵢ)²)             —— 用于 Cp / Ppk / σ 水平，与 nᵢ 无关
     返回    : 含 wc / rss 两套结果、贡献率、判定、建议的字典
     """
-    n_sigma = float(n_sigma)
-    if not (2.0 <= n_sigma <= 10.0):
-        raise DesignError("统计法评估带宽 n 必须在 2 ~ 10 个 σ 之间")
+    n_sigma = check_sigma_grade(n_sigma, "缺省")
     act = [l for l in links if l.get("enabled", True)]
     if not act:
         raise DesignError("至少需要一个参与计算的组成环")
@@ -515,24 +546,35 @@ def analyze(links: list[dict], target: dict | None = None,
     rows, N0 = [], 0.0
     sum_T = 0.0
     sum_var = 0.0
+    sum_band2 = 0.0
     d0_wc = 0.0
     sum_shift = 0.0
     for l in act:
+        if l.get("sigma_grade") in (None, ""):
+            l = {**l, "sigma_grade": n_sigma}       # 兼容未带 σ 等级的旧数据
         c = link_calc(l, use_thermal)
         N0 += c["xi"] * c["nominal"]
         sum_T += abs(c["xi"]) * c["T"]
         sum_var += (c["xi"] * c["k"] * c["T"]) ** 2
+        sum_band2 += (c["xi"] * c["band"]) ** 2
         d0_wc += c["xi"] * c["dmid"]
         sum_shift += c["shift"]
         rows.append({**l, **c})
 
     sigma0 = math.sqrt(sum_var) / 6.0
-    T_rss = n_sigma * sigma0
+    T_rss = math.sqrt(sum_band2)
     d0_rss = d0_wc + sum_shift
+    # 等效带宽倍数：T_rss / σ₀。全环同为 n 时它就是 n
+    n_eff = (T_rss / sigma0) if sigma0 > 0 else n_sigma
+    grades = sorted({float(r["sigma_grade"]) for r in rows})
+    uniform = len(grades) == 1
 
     wc = _summarize(sum_T, d0_wc, N0, None)
     rss = _summarize(T_rss, d0_rss, N0, sigma0)
-    rss["n_sigma"] = n_sigma
+    rss["n_sigma"] = grades[0] if uniform else n_eff
+    rss["n_eff"] = n_eff
+    rss["sigma_grades"] = grades
+    rss["uniform_grade"] = uniform
 
     # ---- 贡献率 ----
     tot_T = sum_T or 1.0
@@ -561,6 +603,9 @@ def analyze(links: list[dict], target: dict | None = None,
         "contrib": contrib,
         "use_thermal": use_thermal,
         "n_sigma": n_sigma,
+        "n_eff": n_eff,
+        "sigma_grades": grades,
+        "uniform_grade": uniform,
     }
 
     # ---- 与封闭环要求比对 ----
@@ -648,6 +693,17 @@ ALLOC_METHODS = {
 }
 
 
+def band_factor(link: dict) -> float:
+    """统计法分配的带宽系数 bᵢ：合成带宽 T_rss = √(Σ (bᵢ·Tᵢ)²)，bᵢ = nᵢ·kᵢ/6。
+
+    默认全环 ±3σ、正态（k = 1）时 bᵢ = 0.5；旧版固定 6σ 口径下 bᵢ = 1，
+    此时分配结果与旧版逐位一致（向后兼容）。
+    """
+    sg = link.get("sigma_grade", DEFAULT_SIGMA_GRADE)
+    sg = DEFAULT_SIGMA_GRADE if sg in (None, "") else float(sg)
+    return sg * float(link.get("k", 1.0)) / 6.0
+
+
 def allocate(links: list[dict], closing_tol: float,
              method: str = "equal", rule: str = "rss",
              weights: dict | None = None,
@@ -667,11 +723,19 @@ def allocate(links: list[dict], closing_tol: float,
     weights = weights or {}
     out = []
 
+    bfac = [band_factor(l) for l in act]
+
     if method == "equal":
-        t_each = closing_tol / m if rule == "wc" else closing_tol / math.sqrt(m)
+        if rule == "wc":
+            t_each = closing_tol / m
+            basis = f"T₀ / m = {closing_tol:.4g} / {m} = {t_each:.4g} mm"
+        else:
+            denom = math.sqrt(sum(b * b for b in bfac)) or 1.0
+            t_each = closing_tol / denom
+            basis = (f"T₀ / √(Σ bᵢ²) = {closing_tol:.4g} / {denom:.4g}"
+                     f" = {t_each:.4g} mm（bᵢ = nᵢ·kᵢ/6）")
         for l in act:
-            out.append({"link": l, "T": t_each, "grade": None,
-                        "basis": f"T₀ / {'m' if rule == 'wc' else '√m'} = {t_each:.4g} mm"})
+            out.append({"link": l, "T": t_each, "grade": None, "basis": basis})
 
     elif method == "grade":
         # 求公共公差等级系数 a：Σ a·iᵢ = T₀ 或 √(Σ(a·iᵢ)²) = T₀
@@ -679,7 +743,8 @@ def allocate(links: list[dict], closing_tol: float,
         for l in act:
             nom = _thermal(l, use_thermal)[0]
             fac.append(tolerance_factor(nom) / 1000.0)      # mm
-        denom = sum(fac) if rule == "wc" else math.sqrt(sum(f * f for f in fac))
+        denom = (sum(fac) if rule == "wc"
+                 else math.sqrt(sum((f * b) ** 2 for f, b in zip(fac, bfac))) or 1.0)
         a = closing_tol / denom
         for l, f in zip(act, fac):
             nom = _thermal(l, use_thermal)[0]
@@ -698,7 +763,7 @@ def allocate(links: list[dict], closing_tol: float,
         if rule == "wc":
             s = sum(ws)
         else:
-            s = math.sqrt(sum(w * w for w in ws))
+            s = math.sqrt(sum((w * b) ** 2 for w, b in zip(ws, bfac))) or 1.0
         for l, w in zip(act, ws):
             t = closing_tol * w / s
             out.append({"link": l, "T": t, "grade": None,

@@ -92,18 +92,24 @@ def test_huawei_example():
     check("WC 半带（即 ± 值）", r["wc"]["es"], 0.25, 1e-12)
     check("WC 全带 T = ΣTᵢ", r["wc"]["T"], 0.5, 1e-12)
     check("WC 上下对称", r["wc"]["ei"], -0.25, 1e-12)
-    check("RSS 半带 = √(ΣTᵢ²)/2", r["rss"]["es"], math.sqrt(5 * 0.05 ** 2), 1e-12)
-    log(f"      └ RSS = ±{r['rss']['es']:.4f}（胶片写 ±0.11）  "
-        f"全带 {r['rss']['T']:.4f}")
+    # 默认全环 ±3σ：带宽ᵢ = 3σᵢ = Tᵢ/2，T_rss = √(Σ(ξᵢ·3σᵢ)²) = √(ΣTᵢ²)/2，半带 = ÷2
+    check("RSS 半带 = √(ΣTᵢ²)/4（默认全环 ±3σ）", r["rss"]["es"],
+          math.sqrt(5 * 0.1 ** 2) / 4, 1e-12)
+    log(f"      └ RSS = ±{r['rss']['es']:.4f}　全带 {r['rss']['T']:.4f}"
+        f"（胶片 ±0.11 是 6σ 口径，等价于把全环 σ 等级切到 ±6σ）")
     check("σ₀ = √Σσᵢ²", r["rss"]["sigma"], math.sqrt(5) * 0.1 / 6, 1e-12)
     check("推荐口径（5 环 → 统计法）", r["recommend"], "rss")
 
-    log("【2】华为内部胶片算例：5 个不等公差环 → ±0.43")
+    log("【2】华为内部胶片算例：5 个不等公差环 → ±0.43（6σ 口径）")
     r2 = analyze(example_links("rss5"))
-    want = math.sqrt(0.1 ** 2 + 0.15 ** 2 + 0.2 ** 2 + 0.15 ** 2 + 0.3 ** 2)
-    check("RSS 半带", r2["rss"]["es"], want, 1e-12)
-    log(f"      └ ±{r2['rss']['es']:.4f}（胶片写 ±0.43）")
-    check_true("≈ ±0.43", abs(r2["rss"]["es"] - 0.43) < 0.001)
+    want = math.sqrt(0.2 ** 2 + 0.3 ** 2 + 0.4 ** 2 + 0.3 ** 2 + 0.6 ** 2)
+    check("RSS 全带 T_rss = √(ΣTᵢ²)/2（默认 ±3σ）", r2["rss"]["T"], want / 2, 1e-12)
+    log(f"      └ ±{r2['rss']['es']:.4f}　全带 {r2['rss']['T']:.4f}"
+        f"（胶片 ±0.43 = 6σ 口径的半带）")
+    check_true("全带 ≈ 0.43（即胶片 ±0.43 的半带值）",
+               abs(r2["rss"]["T"] - 0.43) < 0.001)
+    r2b = analyze([dict(l, sigma_grade=6.0) for l in example_links("rss5")])
+    check("切回 ±6σ 后 ≈ 胶片 ±0.43", r2b["rss"]["es"], 0.43, 0.001)
 
 
 def test_sigma_table():
@@ -218,12 +224,17 @@ def test_allocate():
     check("复算 WC 总公差", al["T_wc"], 0.25, 1e-12)
 
     al2 = allocate(default_links(), 0.25, method="equal", rule="rss")
-    check("等公差 RSS 每环", al2["rows"][0]["T"], 0.25 / math.sqrt(5), 1e-12)
-    log(f"      └ RSS 反推每环 = ±{al2['rows'][0]['T']:.4f}"
-        f"（胶片写「若要求 ±0.25，每环可放宽到 ±0.1」）")
-    check_true("与胶片 ±0.1 同量级",
-               0.08 < al2["rows"][0]["T"] < 0.13,
-               f"（{al2['rows'][0]['T']:.4f}）")
+    # 默认全环 ±3σ → 带宽系数 bᵢ = nᵢ·kᵢ/6 = 0.5，T = T₀/√(Σbᵢ²) = 0.25/√1.25
+    check("等公差 RSS 每环（±3σ）", al2["rows"][0]["T"],
+          0.25 / math.sqrt(5 * 0.25), 1e-12)
+    log(f"      └ RSS 反推每环 = ±{al2['rows'][0]['T']:.4f}（±3σ 口径）")
+    check_true("RSS 复算回到 T₀", abs(al2["T_rss"] - 0.25) < 1e-9,
+               f"（{al2['T_rss']:.6f}）")
+    al2b = allocate([dict(l, sigma_grade=6.0) for l in default_links()],
+                    0.25, method="equal", rule="rss")
+    check_true("切 ±6σ 后每环 ±0.11（胶片「±0.25 → 每环 ±0.1」）",
+               0.08 < al2b["rows"][0]["T"] < 0.13,
+               f"（{al2b['rows'][0]['T']:.4f}）")
 
     al3 = allocate(default_links(), 0.25, method="grade", rule="wc")
     check_true("等公差等级给出标准等级",
@@ -324,7 +335,8 @@ def test_explicit_xi():
     r = analyze([new_link(nominal=10.0, es=0.05, ei=-0.05, xi=0.5)])
     check("ξ=0.5 单环 N₀", r["nominal"], 5.0, 1e-12)
     check("ξ=0.5 单环 WC 半带", r["wc"]["T"] / 2.0, 0.025, 1e-12)
-    check("ξ=0.5 单环 RSS 半带", r["rss"]["T"] / 2.0, 0.025, 1e-12)
+    # 默认 ±3σ：带宽 = 3σ = ξ·T/2 = 0.025，单环时 T_rss 就等于该带宽
+    check("ξ=0.5 单环 RSS 全带（±3σ）", r["rss"]["T"], 0.025, 1e-12)
     # 显式负 ξ：-0.707（投影方向反向）
     r2 = analyze([new_link(nominal=10.0, es=0.05, ei=-0.05, xi=-0.707)])
     check("ξ=-0.707 单环 N₀", r2["nominal"], -7.07, 1e-12)
@@ -336,26 +348,59 @@ def test_explicit_xi():
           link_calc(al["new_links"][0])["xi"], 0.5, 1e-12)
 
 
-def test_n_sigma():
+def test_sigma_grade():
     log("")
-    log("【11b】统计法评估带宽 n·σ 可选（华为表格默认 ±6σ）")
+    log("【11b】每环独立 σ 等级（默认全环 ±3σ，即 T 为 6σ 的标准正态口径）")
     L = [new_link(no=f"A{i}", nominal=10.0 + i, es=0.05, ei=-0.05)
          for i in range(1, 6)]
-    r6 = analyze(L)
-    check("默认 n_sigma", r6["n_sigma"], 6.0, 1e-12)
-    check("默认 T_rss = 6σ₀", r6["rss"]["T"], 6.0 * r6["rss"]["sigma"], 1e-12)
-    r4 = analyze(L, n_sigma=4.0)
-    check("n=4 记录", r4["rss"]["n_sigma"], 4.0, 1e-12)
-    check("n=4 T_rss = 4σ₀", r4["rss"]["T"], 4.0 * r4["rss"]["sigma"], 1e-12)
-    # σ₀ 与 WC 不随 n 变——变的只是评估带宽
-    check("σ₀ 不随 n 变", r4["rss"]["sigma"], r6["rss"]["sigma"], 1e-12)
-    check("WC 不随 n 变", r4["wc"]["T"], r6["wc"]["T"], 1e-12)
-    check("T(n=4) / T(n=6) = 2/3", r4["rss"]["T"] / r6["rss"]["T"], 2.0 / 3.0, 1e-12)
-    try:
-        analyze(L, n_sigma=1.0)
-        check_true("n 越界应报错", False, "（未抛异常）")
-    except DesignError:
-        check_true("n 越界应报错", True)
+    r3 = analyze(L)
+    check("缺省 σ 等级 = 3", r3["n_sigma"], 3.0, 1e-12)
+    check("每环 σ 等级默认 ±3σ",
+          [l["sigma_grade"] for l in r3["links"]], [3.0] * 5)
+    check("默认 T_rss = 3σ₀", r3["rss"]["T"], 3.0 * r3["rss"]["sigma"], 1e-12)
+    check("全环同档 → 等效带宽 = 3", r3["n_eff"], 3.0, 1e-12)
+    # 物理含义：±3σ 时该环评估带宽 = 3σᵢ = Tᵢ/2 = 0.05
+    check("±3σ 时每环带宽 = Tᵢ/2", r3["links"][0]["band"], 0.05, 1e-12)
+
+    log("      · 切到 ±6σ：带宽翻倍，等价于旧版的 6σ 口径")
+    r6 = analyze([dict(l, sigma_grade=6.0) for l in L])
+    check("全环 ±6σ 的 T_rss", r6["rss"]["T"], 6.0 * r6["rss"]["sigma"], 1e-12)
+    check("6σ / 3σ 带宽比 = 2", r6["rss"]["T"] / r3["rss"]["T"], 2.0, 1e-12)
+    check("±6σ 时每环带宽 = Tᵢ", r6["links"][0]["band"], 0.1, 1e-12)
+
+    log("      · 混合档位：环1 ±6σ，其余 ±3σ → 逐环独立带宽")
+    rm = analyze([dict(l, sigma_grade=(6.0 if i == 0 else 3.0))
+                  for i, l in enumerate(L)])
+    want = math.sqrt((6 * 0.1 / 6) ** 2 + 4 * (3 * 0.1 / 6) ** 2)
+    check("混合档位 T_rss = √(Σ(ξᵢ·nᵢ·σᵢ)²)", rm["rss"]["T"], want, 1e-12)
+    check("混合档位标记为非统一", rm["uniform_grade"], False)
+    check("混合档位 σ 等级集合", rm["sigma_grades"], [3.0, 6.0])
+    check_true("等效带宽介于 3 与 6 之间", 3.0 < rm["n_eff"] < 6.0,
+               f"（n_eff = {rm['n_eff']:.4f}）")
+
+    log("      · σ 等级不动的量：WC、σ₀、Cp / Ppk")
+    check("σ₀ 不随 σ 等级变", r6["rss"]["sigma"], r3["rss"]["sigma"], 1e-12)
+    check("WC 不随 σ 等级变", r6["wc"]["T"], r3["wc"]["T"], 1e-12)
+    tgt = {"es": 0.25, "ei": -0.25}
+    c3 = analyze(L, target=tgt)["verdict"]["rss"]
+    c6 = analyze([dict(l, sigma_grade=6.0) for l in L],
+                 target=tgt)["verdict"]["rss"]
+    check("Cp 不随 σ 等级变", c6["cp"], c3["cp"], 1e-12)
+    check("Ppk 不随 σ 等级变", c6["ppk"], c3["ppk"], 1e-12)
+
+    log("      · 缺省档（n_sigma 参数）对不带该字段的环生效")
+    bare = [{k: v for k, v in l.items() if k != "sigma_grade"} for l in L]
+    rd = analyze(bare, n_sigma=5.0)
+    check("缺省档写入每环", rd["links"][0]["sigma_grade"], 5.0, 1e-12)
+    check("缺省档 T_rss = 5σ₀", rd["rss"]["T"], 5.0 * rd["rss"]["sigma"], 1e-12)
+
+    log("      · 边界与容错")
+    for bad in (0.5, 12.0):
+        check_true(f"缺省档 {bad} 越界应报错", _raises(lambda b=bad: analyze(L, n_sigma=b)))
+    check_true("单环 σ 等级越界应报错",
+               _raises(lambda: analyze([dict(L[0], sigma_grade=0.5)])))
+    check_true("单环 σ 等级为空时回落到缺省",
+               analyze([dict(L[0], sigma_grade=None)])["links"][0]["sigma_grade"] == 3.0)
 
 
 # =====================================================================
@@ -579,13 +624,13 @@ def test_ui():
         check("删除后回到 5 行", tol.table.rowCount(), 5)
 
         # ---- 组成环表的只读计算列必须被回填（否则要空着三列很浪费）----
-        check_true("公差列已回填", tol.table.item(0, 7).text() not in ("", "—"),
-                   f"（{tol.table.item(0, 7).text()}）")
+        check_true("公差列已回填", tol.table.item(0, 8).text() not in ("", "—"),
+                   f"（{tol.table.item(0, 8).text()}）")
         check("ξ 列已回填（自动档显示实际系数）",
-              tol.table.cellWidget(0, 8).currentText(), "自动（+1）")
+              tol.table.cellWidget(0, 9).currentText(), "自动（+1）")
         check_true("贡献率列已回填",
-                   tol.table.item(0, 9).text().endswith("%"),
-                   f"（{tol.table.item(0, 9).text()}）")
+                   tol.table.item(0, 10).text().endswith("%"),
+                   f"（{tol.table.item(0, 10).text()}）")
         # 回填必须屏蔽 cellChanged，否则 recalc 会自激成死循环；
         # 能跑到这里就说明没锁死，再确认一次结果仍在
         check_true("回填后结果依然有效（未自激死循环）", tol._res is not None)
@@ -596,7 +641,7 @@ def test_ui():
         win.tabs.setCurrentIndex(0)
         for _ in range(6):
             app.processEvents()
-        xb = tol.table.cellWidget(0, 8)
+        xb = tol.table.cellWidget(0, 9)
         check_true("ξ 列是下拉框", isinstance(xb, QComboBox))
         check("ξ 选项数", xb.count(), 11)
         xb.setCurrentIndex(xb.findText("+0.707"))
@@ -715,24 +760,61 @@ def test_ui():
                     if not lt.horizontalHeaderItem(i).toolTip()]
         check_true("全部表头都有悬浮说明", not tips_bad,
                    f"（缺：{tips_bad}）")
-        check("ξ 表头写全称", lt.horizontalHeaderItem(8).text(), "传递系数\nξ")
+        check("ξ 表头写全称", lt.horizontalHeaderItem(9).text(), "传递系数\nξ")
+        check("σ 等级列表头存在", lt.horizontalHeaderItem(7).text(), "σ 等级")
         check_true("名称列吃掉余量（贡献率列不再独吞空白）",
                    lt.horizontalHeader().sectionResizeMode(1)
                    == QHeaderView.ResizeMode.Stretch)
-        check("贡献率列定宽不再拉伸", lt.columnWidth(9), 110)
-        check_true("统计法评估带宽下拉存在",
-                   tol.cb_nsigma.currentText().startswith("±6σ"),
+        check("贡献率列定宽不再拉伸", lt.columnWidth(10), 110)
+
+        # ---- 每环 σ 等级：逐环下拉 + 统一档位 ----
+        check_true("统一 σ 等级下拉默认 ±3σ",
+                   tol.cb_nsigma.currentText().startswith("±3σ"),
                    f"（{tol.cb_nsigma.currentText()}）")
-        tol.cb_nsigma.setCurrentIndex(2)          # 切 ±4σ
+        check("每环 σ 等级默认为 ±3σ",
+              [l["sigma_grade"] for l in STATE.links],
+              [3.0] * len(STATE.links))
+        check_true("σ 等级列是下拉框",
+                   lt.cellWidget(0, 7) is not None
+                   and lt.cellWidget(0, 7).currentText() == "±3σ")
+        tol.cb_nsigma.setCurrentIndex(3)          # 统一切到 ±6σ
         for _ in range(6):
             app.processEvents()
-        check("切 ±4σ 后 n_sigma 生效", tol._res["rss"]["n_sigma"], 4.0, 1e-12)
-        check("RSS 卡片标题跟随口径", tol.m_rss.name.text(), "统计法 RSS ±4σ")
-        r6 = tol._res["rss"]["sigma"]
-        check("±4σ 半带 = 2σ₀", tol._res["rss"]["T"] / 2.0, 2.0 * r6, 1e-9)
-        tol.cb_nsigma.setCurrentIndex(0)          # 恢复默认 ±6σ
+        check("统一切档后缺省档 = 6", tol._res["n_sigma"], 6.0, 1e-12)
+        check("统一切档把所有环改成 ±6σ",
+              [l["sigma_grade"] for l in STATE.links],
+              [6.0] * len(STATE.links))
+        check("RSS 卡片标题跟随口径", tol.m_rss.name.text(), "统计法 RSS ±6σ")
+        sig6 = tol._res["rss"]["sigma"]
+        check("±6σ 全带 = 6σ₀", tol._res["rss"]["T"], 6.0 * sig6, 1e-9)
+
+        # 逐环覆盖：把第 1 行单独调回 ±3σ → 变成混合档位
+        nb0 = lt.cellWidget(0, 7)
+        nb0.setCurrentIndex(0)
         for _ in range(6):
             app.processEvents()
+        tol.recalc()        # 逐环下拉走 240ms 防抖定时器，测试里直接触发
+        check("逐环覆盖生效", STATE.links[0]["sigma_grade"], 3.0, 1e-12)
+        check_true("混合档位时卡片显示等效值",
+                   tol.m_rss.name.text().startswith("统计法 RSS ≈"),
+                   f"（{tol.m_rss.name.text()}）")
+        # 第 1 环的公差带已被前面的「标准选取」测试改过 → 期望值按各环实际数据构造
+        check("混合档位：第 1 环 ±3σ、其余 ±6σ",
+              [l["sigma_grade"] for l in tol._res["links"]], [3.0] + [6.0] * 4)
+        want_mix = math.sqrt(sum(
+            (l["sigma_grade"] * l["k"] * l["T"] / 6.0) ** 2
+            for l in tol._res["links"]))
+        check("混合档位 T_rss = √(Σ(ξᵢnᵢσᵢ)²)",
+              tol._res["rss"]["T"], want_mix, 1e-9)
+        check_true("混合档位等效带宽落在 3~6 之间",
+                   3.0 < tol._res["n_eff"] < 6.0,
+                   f"（n_eff = {tol._res['n_eff']:.4f}）")
+        tol.cb_nsigma.setCurrentIndex(0)          # 恢复默认 ±3σ
+        for _ in range(6):
+            app.processEvents()
+        check("恢复默认后全环 ±3σ",
+              [l["sigma_grade"] for l in STATE.links],
+              [3.0] * len(STATE.links))
 
         # ---- 公差仿真页 ----
         sim = pages[1]
@@ -823,7 +905,7 @@ def main():
     for fn in (test_huawei_example, test_sigma_table, test_it_table,
                test_deviations, test_auto_signs, test_allocate,
                test_monte_carlo, test_capability, test_thermal,
-               test_explicit_xi, test_n_sigma):
+               test_explicit_xi, test_sigma_grade):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001
